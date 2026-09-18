@@ -154,7 +154,8 @@ jobs:
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
-          SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET }}
+          SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET || 'dev-secret-key-change-me-in-production-32-chars' }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY || 'dev-secret-key-change-me-in-production-32-chars' }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
