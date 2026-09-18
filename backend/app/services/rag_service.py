@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from uuid import UUID
 
 import httpx
 
 from backend.app.core.config import settings
 from backend.app.services.ingestion import DocumentChunk, get_loader
+from backend.app.services.rag_bm25_fallback import bm25_search
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +24,21 @@ _EMBED_MODEL = "embed-v4.0"
 _EMBED_DIM = 1536
 _DEFAULT_MATCH_COUNT = 20
 _EMBED_CACHE_MAX = 1024
+_VECTOR_SEARCH_TIMEOUT_S: Final[float] = 2.0
 
 _embed_cache: OrderedDict[str, list[float]] = OrderedDict()
 _embed_cache_stats: dict[str, int] = {"hits": 0, "misses": 0, "api_calls": 0}
+
+SOURCE_HYBRID = "hybrid_supabase"
+SOURCE_BM25 = "fallback_bm25"
+
+
+@dataclass(frozen=True, slots=True)
+class RagSearchResult:
+    hits: list[dict[str, Any]]
+    source: str
+    status: str
+
 
 
 def _embed_cache_key(text: str, *, model: str, input_type: str) -> str:
@@ -255,7 +270,7 @@ def _flashrank_rerank(query: str, candidates: list[dict[str, Any]]) -> list[dict
         return candidates
 
 
-async def hybrid_search(
+async def _vector_hybrid_search(
     workspace_id: str | UUID,
     query: str,
     *,
@@ -268,11 +283,11 @@ async def hybrid_search(
 
     vectors = await embed_texts([query], input_type="search_query")
     if not vectors:
-        return []
+        raise RuntimeError("cohere_embed_unavailable")
 
     client = _get_supabase_client()
     if client is None:
-        return []
+        raise RuntimeError("supabase_unavailable")
 
     try:
         response = client.rpc(
@@ -287,6 +302,70 @@ async def hybrid_search(
         candidates = list(response.data or [])
     except Exception as exc:  # noqa: BLE001
         logger.warning("hybrid_search_rrf RPC failed: %s", exc)
-        return []
+        raise
 
     return _flashrank_rerank(query, candidates[:match_count])
+
+
+async def hybrid_search(
+    workspace_id: str | UUID,
+    query: str,
+    *,
+    match_count: int = _DEFAULT_MATCH_COUNT,
+) -> list[dict[str, Any]]:
+    """Backward-compatible list API — prefers vector, falls back to BM25."""
+    result = await search_workspace(
+        workspace_id, query, match_count=match_count
+    )
+    return result.hits
+
+
+async def search_workspace(
+    workspace_id: str | UUID,
+    query: str,
+    *,
+    match_count: int = _DEFAULT_MATCH_COUNT,
+) -> RagSearchResult:
+    """Vector hybrid search with 2s timeout; BM25 local fallback on failure."""
+    query = (query or "").strip()
+    if not query:
+        return RagSearchResult(hits=[], source=SOURCE_HYBRID, status="empty")
+
+    try:
+        hits = await asyncio.wait_for(
+            _vector_hybrid_search(
+                workspace_id, query, match_count=match_count
+            ),
+            timeout=_VECTOR_SEARCH_TIMEOUT_S,
+        )
+        if hits:
+            return RagSearchResult(
+                hits=hits, source=SOURCE_HYBRID, status="ok"
+            )
+        return RagSearchResult(
+            hits=[], source=SOURCE_HYBRID, status="empty"
+        )
+    except Exception as exc:  # noqa: BLE001 — timeout / network / RPC
+        logger.warning(
+            "Vector RAG failed (%s); falling back to BM25",
+            type(exc).__name__,
+        )
+
+    try:
+        hits = await asyncio.to_thread(
+            bm25_search,
+            workspace_id,
+            query,
+            match_count=match_count,
+        )
+    except Exception as bm25_exc:  # noqa: BLE001
+        logger.warning("BM25 fallback failed: %s", bm25_exc)
+        return RagSearchResult(
+            hits=[], source=SOURCE_BM25, status="error"
+        )
+
+    if hits:
+        return RagSearchResult(
+            hits=hits, source=SOURCE_BM25, status="degraded_bm25"
+        )
+    return RagSearchResult(hits=[], source=SOURCE_BM25, status="empty")

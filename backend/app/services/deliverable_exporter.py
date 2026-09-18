@@ -332,6 +332,106 @@ def build_phase_pdf(
     return _render_pdf_from_html(html_string)
 
 
+def build_uat_sheet_markdown(
+    *,
+    project_name: str,
+    phase: int,
+    phase_title: str,
+    deliverables: list[str],
+    validator_name: str,
+    signed_at_utc: str,
+    content_sha256: str,
+    notes: str = "",
+) -> str:
+    """Generate a UAT checklist sheet (Markdown) for the signed-off phase."""
+    rows = "\n".join(
+        f"| UAT-{index:02d} | {_md_cell(item)} | Given/When/Then | - [ ] Pass |  |"
+        for index, item in enumerate(deliverables, start=1)
+    ) or "| — | Aucun livrable | — | - [ ] | |"
+    notes_block = (notes or "").strip() or "_Aucune note._"
+    return (
+        f"# Fiche de tests UAT — {project_name}\n\n"
+        f"- **Phase :** {int(phase)} — {phase_title}\n"
+        f"- **Validateur :** {validator_name}\n"
+        f"- **Horodatage UTC :** {signed_at_utc}\n"
+        f"- **Empreinte SHA-256 (contenu PVR) :** `{content_sha256}`\n\n"
+        "## Scénarios\n\n"
+        "| ID | Livrable / scénario | Steps | Résultat | Commentaire |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        f"{rows}\n\n"
+        "## Critères d'entrée\n\n"
+        "- [ ] Environnement de recette disponible\n"
+        "- [ ] Jeu de données de test chargé\n"
+        "- [ ] Livrables de la phase transmis au métier\n\n"
+        "## Critères de sortie\n\n"
+        "- [ ] Tous les scénarios critiques Pass\n"
+        "- [ ] Anomalies bloquantes corrigées ou acceptées\n"
+        "- [ ] PVR signé (hash ci-dessus)\n\n"
+        f"## Notes\n\n{notes_block}\n"
+    )
+
+
+def _md_cell(text: str) -> str:
+    return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def build_pvr_pdf(
+    *,
+    project_name: str,
+    phase: int,
+    phase_title: str,
+    deliverables: list[str],
+    validator_name: str,
+    signed_at_utc: str,
+    content_sha256: str,
+    notes: str = "",
+    accepted: bool = True,
+) -> bytes:
+    """Build the official Procès-Verbal de Recette (PVR) PDF."""
+    decision = "ACCEPTÉ" if accepted else "REFUSÉ"
+    bullets = "".join(f"<li>{_html_escape(item)}</li>" for item in deliverables)
+    if not bullets:
+        bullets = "<li>Aucun livrable listé</li>"
+    notes_html = _html_escape(notes.strip()) if notes.strip() else "<em>Aucune</em>"
+
+    html_string = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <style>
+    @page {{ margin: 2cm; }}
+    body {{ font-family: system-ui, Segoe UI, sans-serif; color: #111; font-size: 11pt; }}
+    .header {{ background: #0f3460; color: #fff; padding: 18px 20px; margin: -10px -10px 24px -10px; }}
+    .header h1 {{ margin: 0; font-size: 18pt; }}
+    .meta {{ margin: 8px 0; }}
+    .hash {{ font-family: ui-monospace, Consolas, monospace; font-size: 9pt; word-break: break-all; }}
+    .stamp {{ display: inline-block; border: 2px solid #0f3460; padding: 6px 12px; font-weight: 700; }}
+    ul {{ padding-left: 1.2em; }}
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Procès-Verbal de Recette (PVR)</h1>
+    <p>Fuzyo Copilot — Phase 07 UAT / Sign-off</p>
+  </div>
+  <p class="meta"><strong>Projet :</strong> {_html_escape(project_name)}</p>
+  <p class="meta"><strong>Phase validée :</strong> {int(phase)} — {_html_escape(phase_title)}</p>
+  <p class="meta"><strong>Validateur :</strong> {_html_escape(validator_name)}</p>
+  <p class="meta"><strong>Horodatage UTC :</strong> {_html_escape(signed_at_utc)}</p>
+  <p class="meta"><strong>Décision :</strong> <span class="stamp">{_html_escape(decision)}</span></p>
+  <h2>Liste des livrables</h2>
+  <ul>{bullets}</ul>
+  <h2>Signature numérique</h2>
+  <p>Empreinte SHA-256 du contenu canonique du PVR (JSON normalisé) :</p>
+  <p class="hash">{_html_escape(content_sha256)}</p>
+  <h2>Notes</h2>
+  <p>{notes_html}</p>
+</body>
+</html>
+"""
+    return _render_pdf_from_html(html_string)
+
+
 def download_filename(
     workspace_name: str,
     phase: int,

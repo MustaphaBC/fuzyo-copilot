@@ -9,11 +9,14 @@ from typing import Annotated, Any, Final
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from backend.app.api.deps import CurrentUser, ensure_owned_workspace, get_current_user
 from backend.app.core.config import settings
+from backend.app.core.logging_config import get_logger
+from backend.app.core.rate_limit import limiter
+from backend.app.core.sentry_setup import capture_sse_exception
 from backend.app.prompts.sdlc_prompts import build_elite_system_prompt
 from backend.app.prompts.skill_prompts import (
     SKILL_SYSTEM_PROMPTS,
@@ -39,10 +42,12 @@ from backend.app.services.gatekeeper import evaluate_response
 from backend.app.services.llm_base import BaseLLMClient
 from backend.app.services.local_stub import MockLocalLLMClient
 from backend.app.services.privacy_router import route_prompt
-from backend.app.services.rag_service import hybrid_search
+from backend.app.services.rag_service import search_workspace
+from backend.app.services.token_tracker import estimate_token_usage, log_token_usage
 from supabase import create_client
 
 router = APIRouter(tags=["chat"])
+_log = get_logger("fuzyo.chat")
 
 _MAX_RETRY_ATTEMPTS: Final[int] = 3
 
@@ -251,16 +256,21 @@ async def _event_stream(
 
     rag_hits: list[dict[str, Any]] = []
     if decision.requires_rag and request.workspace_id:
+        rag_source = "hybrid_supabase"
         try:
-            rag_hits = await hybrid_search(request.workspace_id, rag_query)
-            status = "ok" if rag_hits else "empty"
+            rag_result = await search_workspace(request.workspace_id, rag_query)
+            rag_hits = rag_result.hits
+            rag_source = rag_result.source
+            status = rag_result.status
         except Exception:  # noqa: BLE001
             status = "error"
             rag_hits = []
+            rag_source = "fallback_bm25"
         yield _sse(
             {
                 "type": "rag",
                 "status": status,
+                "source": rag_source,
                 "hit_count": len(rag_hits),
                 "query": rag_query,
                 "snippets": [
@@ -275,6 +285,7 @@ async def _event_stream(
             {
                 "type": "rag",
                 "status": "skipped",
+                "source": "none",
                 "hit_count": 0,
                 "query": rag_query,
                 "snippets": [],
@@ -310,6 +321,7 @@ async def _event_stream(
     client = _resolve_client(decision)
 
     full_text_parts: list[str] = []
+    completion_texts: list[str] = []
     used_openrouter = False
     used_local_billing_fallback = False
 
@@ -407,6 +419,7 @@ async def _event_stream(
         yield event
 
     full_text = "".join(full_text_parts)
+    completion_texts.append(full_text)
     score = await evaluate_response(full_text, sdlc_phase=int(request.sdlc_phase))
     yield _quality_sse(score)
 
@@ -453,6 +466,7 @@ async def _event_stream(
             yield event
 
         retry_text = "".join(retry_parts)
+        completion_texts.append(retry_text)
         score = await evaluate_response(
             retry_text, sdlc_phase=int(request.sdlc_phase)
         )
@@ -460,6 +474,30 @@ async def _event_stream(
 
         if score.feedback:
             accumulated_feedback.append(f"[attempt {attempt}] {score.feedback}")
+
+    # Token / cost accounting — character lengths only; never log prompt bodies.
+    prompt_for_count = f"{system_prompt}\n{user_prompt}"
+    usage = estimate_token_usage(
+        provider=decision.selected_provider,
+        model=decision.selected_model,
+        prompt_text=prompt_for_count,
+        completion_text="".join(completion_texts),
+    )
+    log_token_usage(
+        usage,
+        sdlc_phase=int(request.sdlc_phase),
+        target_client=decision.target_client.value,
+        force_confidential=bool(request.force_confidential),
+    )
+    _log.info(
+        "chat_stream_complete",
+        provider=decision.selected_provider,
+        model=decision.selected_model,
+        sdlc_phase=int(request.sdlc_phase),
+        prompt_chars=len(prompt_for_count),
+        completion_chars=sum(len(chunk) for chunk in completion_texts),
+        force_confidential=bool(request.force_confidential),
+    )
 
 
 async def _admin_restricted_stream(tool: str) -> AsyncIterator[str]:
@@ -488,12 +526,15 @@ async def _admin_restricted_stream(tool: str) -> AsyncIterator[str]:
 
 
 @router.post("/chat/completions")
+@limiter.limit("20/minute")
 async def chat_completions(
-    request: ChatRequest,
+    request: Request,
+    payload: ChatRequest,
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> StreamingResponse:
+    """SSE chat; rate-limited before streaming starts (20/min per client)."""
     workspace_row: dict[str, Any] | None = None
-    if request.workspace_id is not None:
+    if payload.workspace_id is not None:
         url = (settings.supabase_url or "").strip()
         key = (settings.supabase_secret_key or "").strip()
         if not url or not key:
@@ -505,10 +546,10 @@ async def chat_completions(
                 status_code=503, detail=f"Supabase client error: {exc}"
             ) from exc
         workspace_row = ensure_owned_workspace(
-            client, UUID(str(request.workspace_id)), user.id
+            client, UUID(str(payload.workspace_id)), user.id
         )
 
-    blocked_tool = intercept_admin_tools(request.prompt, user.role)
+    blocked_tool = intercept_admin_tools(payload.prompt, user.role)
     if blocked_tool:
         return StreamingResponse(
             _admin_restricted_stream(blocked_tool),
@@ -521,7 +562,7 @@ async def chat_completions(
         )
 
     return StreamingResponse(
-        _event_stream(request, workspace_row),
+        _guarded_event_stream(payload, workspace_row),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -529,3 +570,39 @@ async def chat_completions(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+async def _guarded_event_stream(
+    request: ChatRequest,
+    workspace: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
+    """Wrap SSE generation so mid-stream failures are captured, not fatal to Uvicorn."""
+    try:
+        async for event in _event_stream(request, workspace):
+            yield event
+    except Exception as exc:  # noqa: BLE001
+        capture_sse_exception(
+            exc,
+            sdlc_phase=int(request.sdlc_phase),
+            force_confidential=bool(request.force_confidential),
+            workspace_id=str(request.workspace_id) if request.workspace_id else None,
+        )
+        yield _sse(
+            {
+                "type": "token",
+                "content": (
+                    "[internal stream error] The request failed mid-stream. "
+                    "Operators have been notified."
+                ),
+            }
+        )
+        yield _sse(
+            {
+                "type": "quality",
+                "is_valid": False,
+                "tier1_schema_pass": False,
+                "tier2_heuristic_pass": False,
+                "tier3_score": 1,
+                "feedback": "stream_error",
+            }
+        )

@@ -35,5 +35,10 @@ class Settings(BaseSettings):
     # Local host directory for workspace projects (empty → <repo>/workspace_projects)
     local_workspace_storage_path: str = ""
 
+    # Observability
+    sentry_dsn: str = ""
+    sentry_environment: str = "development"
+    sentry_traces_sample_rate: float = 0.0
+
 
 settings = Settings()

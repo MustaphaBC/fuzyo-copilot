@@ -9,6 +9,7 @@
 **/venv
 **/node_modules
 **/*.log
+logs/
 **/test-results
 **/playwright-report
 **/blob-report
