@@ -175,13 +175,12 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
           RUN_LIVE_TESTS: "true"
           LIVE_API_BASE_URL: ${{ secrets.LIVE_API_BASE_URL }}
-          LIVE_BEARER_TOKEN: ${{ secrets.LIVE_BEARER_TOKEN }}
           SUPABASE_JWT_SECRET: ${{ secrets.SUPABASE_JWT_SECRET || 'dev-secret-key-change-me-in-production-32-chars' }}
         run: |
           export LIVE_API_BASE_URL="${LIVE_API_BASE_URL:-http://127.0.0.1:8000}"
 
           # Génération dynamique d'un token signé avec la clé exacte d'Uvicorn
-          TOKEN=$(python -c "import jwt; print(jwt.encode({'sub': 'test_ci_user', 'role': 'authenticated'}, '${SUPABASE_JWT_SECRET}', algorithm='HS256'))")
+          TOKEN=$(python -c "import jwt; print(jwt.encode({'sub': '00000000-0000-0000-0000-000000000000', 'role': 'authenticated', 'aud': 'authenticated', 'email': 'ci@fuzyo.com'}, '${SUPABASE_JWT_SECRET}', algorithm='HS256'))")
           export LIVE_BEARER_TOKEN="${TOKEN}"
 
           pytest -m live -q --tb=short
