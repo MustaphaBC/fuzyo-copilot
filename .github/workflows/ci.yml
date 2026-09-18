@@ -181,7 +181,7 @@ jobs:
           export LIVE_API_BASE_URL="${LIVE_API_BASE_URL:-http://127.0.0.1:8000}"
 
           # Génération dynamique d'un token signé avec la clé exacte d'Uvicorn
-          TOKEN=$(python -c "import jwt; print(jwt.encode({'sub': 'test_ci_user', 'role': 'authenticated'}, '${SUPABASE_JWT_SECRET}', algorithm='HS256'))")
+          TOKEN=$(python -c "import jwt; print(jwt.encode({'sub': 'test_ci_user', 'role': 'authenticated', 'aud': 'authenticated'}, '${SUPABASE_JWT_SECRET}', algorithm='HS256'))")
           export LIVE_BEARER_TOKEN="${TOKEN}"
 
           pytest -m live -q --tb=short
