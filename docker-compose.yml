@@ -1,0 +1,40 @@
+# Fuzyo Copilot — local full stack
+#
+# Usage:
+#   docker compose up --build
+# Open http://localhost:8080
+#
+# Frontend build-time vars (VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY):
+# put them in a root .env (Compose auto-loads it) or export them before build.
+# Backend secrets: backend/.env (runtime env_file, not baked into the image).
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - backend/.env
+    environment:
+      LOCAL_WORKSPACE_STORAGE_PATH: /data/workspaces
+    volumes:
+      - workspace_data:/data/workspaces
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  workspace_data:

@@ -1,0 +1,57 @@
+---
+description: Fuzyo SDLC AI Assistant Core Architecture & Privacy Routing Rules
+globs: **/*.py, **/*.jsx, **/*.sql
+alwaysApply: true
+---
+
+# Fuzyo Master Engineering Directives
+
+## 1. Privacy & Router Rules
+- ALWAYS check for `force_confidential` flags before making LLM API calls.
+- If `force_confidential == True` or secrets (API keys, passwords, IPs) are detected, route strictly to `MockLocalLLMClient`.
+- Never send sensitive code or user secrets to external cloud endpoints.
+
+## 2. SDLC & Multi-Provider Rules
+- Respect the 9 custom SDLC phases:
+  1. Expression du besoin  2. Analyse fonctionnelle  3. Architecture
+  4. Gestion de projet/PO  5. Développement          6. Tests & QA
+  7. Recette               8. DevOps / CI-CD         9. Mise en production
+- Default Model Mapping:
+  - Architecture/Specs -> Gemini Flash
+  - Fast QA/DevOps/PO -> Groq (Llama 3.3 70B)
+  - Code Generation -> Mistral Codestral / SambaNova
+  - Classifier -> Cerebras Cloud (<150ms)
+
+## 3. Streaming & Validation Rules
+- All chat completion endpoints MUST use Server-Sent Events (SSE) with standard event types: `routing`, `rag`, `token`, `quality`.
+- Every LLM response MUST pass through the 3-Tier Quality Gatekeeper (Tier 1 Pydantic, Tier 2 Heuristics, Tier 3 LLM-as-a-Judge).
+
+## 4. Elite 5-Component Prompt Model
+Runtime system prompts are composed by `backend/app/prompts/sdlc_prompts.py` from the catalog in `backend/app/prompts/sdlc_catalog.py`. Always structure phase guidance as:
+1. **[RÔLE]** — persona élite (BA, Architect, PO, SDET, DevOps, SRE…)
+2. **[CONTEXTE]** — phase SDLC, projet, stack, livrables attendus
+3. **[OBJECTIF]** — unique outcome, no scope creep
+4. **[CONTRAINTES]** — Clean Architecture, OWASP, RGPD/RGAA, typage, zero placeholders
+5. **[FORMAT DE SORTIE]** — Markdown / Mermaid / code / YAML according to phase
+
+Do not invent a parallel prompt source in Cursor; keep IDE guidance aligned with that catalog.
+
+## 5. Phase → Objective & Key Deliverables
+| Phase | Objective (short) | Key deliverables |
+| --- | --- | --- |
+| 01 Expression du besoin | Why / problem framing | CDC, Vision, Actors, Epics, Glossary |
+| 02 Analyse fonctionnelle | What the software must do | SFD, Backlog, UML, Traceability |
+| 03 Architecture | How it is built | DAT, MCD/MPD, ADR, OpenAPI, PoC |
+| 04 Gestion de projet / PO | How to steer priorities | Backlog SP, Sprint plan, Risks |
+| 05 Développement | Implement planned features | Source, modules, unit tests, PRs |
+| 06 Tests & QA | Correctness / no regressions | Test plan, execution, bugs, coverage |
+| 07 Recette (UAT) | Business validation | PVR, UAT sheets, residual defects |
+| 08 DevOps / CI-CD | Automate reliable deploys | Pipeline, IaC, Docker/K8s, runbooks |
+| 09 Mise en prod | Stable secure ops | Prod app, monitoring, post-mortems |
+
+## 6. Output Response Rules (IDE)
+- Skip conversational greetings and filler.
+- When asked for code: complete runnable code, no TODO stubs.
+- When asked for documentation: structured Markdown (headers, tables, bullets).
+- Ph 03: include valid Mermaid when architecture diagrams are requested.
+- Ph 05–06: prefer production-ready code/tests; target ~70–80% coverage guidance for QA.

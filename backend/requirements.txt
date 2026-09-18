@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+httpx
+supabase
+python-dotenv
+pypdf
+python-docx
+openpyxl
+flashrank
+python-multipart
+PyJWT
+cryptography
+markdown>=3.6
+weasyprint>=62.0
+xhtml2pdf

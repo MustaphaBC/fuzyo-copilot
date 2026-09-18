@@ -1,0 +1,20 @@
+# Fichiers d'environnement et secrets
+.env
+*.env
+backend/.env
+frontend/.env
+frontend/.env.e2e
+
+# Caches et builds Python
+__pycache__/
+*.pyc
+.coverage
+.pytest_cache/
+
+# Caches et builds Node / Frontend
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Workspaces et données locales
+workspace_projects/
