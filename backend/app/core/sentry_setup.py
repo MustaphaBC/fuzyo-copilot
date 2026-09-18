@@ -25,20 +25,24 @@ def init_sentry() -> bool:
     if _initialized:
         return True
 
-    sentry_sdk.init(
-        dsn=dsn,
-        integrations=[
-            StarletteIntegration(transaction_style="endpoint"),
-            FastApiIntegration(transaction_style="endpoint"),
-        ],
-        traces_sample_rate=float(settings.sentry_traces_sample_rate or 0.0),
-        send_default_pii=False,
-        environment=(settings.sentry_environment or "development").strip()
-        or "development",
-    )
-    _initialized = True
-    _log.info("sentry_enabled", environment=settings.sentry_environment)
-    return True
+    try:
+        sentry_sdk.init(
+            dsn=dsn,
+            integrations=[
+                StarletteIntegration(transaction_style="endpoint"),
+                FastApiIntegration(transaction_style="endpoint"),
+            ],
+            traces_sample_rate=float(settings.sentry_traces_sample_rate or 0.0),
+            send_default_pii=False,
+            environment=(settings.sentry_environment or "development").strip()
+            or "development",
+        )
+        _initialized = True
+        _log.info("sentry_enabled", environment=settings.sentry_environment)
+        return True
+    except Exception as err:  # noqa: BLE001
+        _log.warning("sentry_init_failed", error=str(err))
+        return False
 
 
 def capture_sse_exception(exc: BaseException, **context: Any) -> None:
@@ -63,7 +67,7 @@ def capture_sse_exception(exc: BaseException, **context: Any) -> None:
         **safe,
     )
     dsn = (settings.sentry_dsn or "").strip()
-    if not dsn and not _initialized:
+    if not dsn or not _initialized:
         return
     try:
         with sentry_sdk.push_scope() as scope:
