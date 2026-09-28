@@ -344,8 +344,8 @@ Apply in Supabase SQL Editor after `05_thread_pins.sql`:
 
 | Variable | Where | Purpose |
 |----------|--------|---------|
-| `VITE_SUPABASE_URL` | `frontend/.env` | Supabase project URL |
-| `VITE_SUPABASE_ANON_KEY` | `frontend/.env` | Public anon key (Auth client only) |
+| `VITE_SUPABASE_URL` | `frontend/.env` (Vite local dev) or root `.env` (Docker Compose build args) | Supabase project URL |
+| `VITE_SUPABASE_ANON_KEY` | `frontend/.env` (Vite local dev) or root `.env` (Docker Compose build args) | Public anon key (Auth client only) |
 | `SUPABASE_URL` | `backend/.env` | Project URL (DB + JWKS discovery) |
 | `SUPABASE_SECRET_KEY` | `backend/.env` | Service role DB access |
 | `SUPABASE_JWT_SECRET` | `backend/.env` | Legacy HS256 JWT Secret (fallback) |
