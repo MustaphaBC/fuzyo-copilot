@@ -1,12 +1,12 @@
 import { Maximize2 } from 'lucide-react'
 import { useEffect, useId, useState } from 'react'
 import mermaid from 'mermaid'
-import { useApp } from '../../context/AppContext'
 import { useArtifact } from '../../context/ArtifactContext'
+import { usePreferences } from '../../context/PreferencesContext'
 import { renderMermaidSafe } from '../../utils/sanitizeMermaid'
 
 export default function MermaidDiagram({ chart, title = 'Architecture diagram' }) {
-  const { appearance } = useApp()
+  const { resolvedAppearance: appearance } = usePreferences()
   const { openArtifact } = useArtifact()
   const reactId = useId().replace(/:/g, '')
   const [svg, setSvg] = useState('')

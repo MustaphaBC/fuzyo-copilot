@@ -3,29 +3,13 @@ import { useMemo, useState } from 'react'
 import { useApp } from '../../context/AppContext'
 import { useUI } from '../../context/UIContext'
 import { apiFetch } from '../../lib/api'
+import { buildLineDiff } from '../../lib/lineDiff'
+import ApplyChangesModal from '../UI/ApplyChangesModal'
 import {
   defaultArtifactFileName,
   notifyWorkspaceFsUpdated,
   saveArtifactToLocalPc,
 } from '../../lib/saveLocalArtifact'
-
-function buildLineDiff(previous, current) {
-  const a = (previous || '').split('\n')
-  const b = (current || '').split('\n')
-  const max = Math.max(a.length, b.length)
-  const rows = []
-  for (let i = 0; i < max; i += 1) {
-    const left = a[i]
-    const right = b[i]
-    if (left === right) {
-      rows.push({ type: 'same', text: right ?? '' })
-    } else {
-      if (left !== undefined) rows.push({ type: 'del', text: left })
-      if (right !== undefined) rows.push({ type: 'add', text: right })
-    }
-  }
-  return rows
-}
 
 export default function CodeDiffViewer({ language, value, previousValue = '' }) {
   const {
@@ -41,6 +25,7 @@ export default function CodeDiffViewer({ language, value, previousValue = '' }) 
   const [applying, setApplying] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [savingLocal, setSavingLocal] = useState(false)
+  const [confirmApply, setConfirmApply] = useState(false)
 
   const lines = useMemo(
     () => buildLineDiff(previousValue, value),
@@ -170,6 +155,12 @@ export default function CodeDiffViewer({ language, value, previousValue = '' }) 
       }
       return
     }
+    setConfirmApply(true)
+  }
+
+  const writeToHost = async () => {
+    setConfirmApply(false)
+    const relativePath = resolveIdePath()
     setSyncing(true)
     try {
       const phase = Number(sdlcPhase) || 5
@@ -330,6 +321,13 @@ export default function CodeDiffViewer({ language, value, previousValue = '' }) 
           ))}
         </pre>
       ) : null}
+      <ApplyChangesModal
+        open={confirmApply}
+        workspaceName={activeWorkspace?.name}
+        files={confirmApply ? [resolveIdePath()] : []}
+        onCancel={() => setConfirmApply(false)}
+        onConfirm={writeToHost}
+      />
     </div>
   )
 }

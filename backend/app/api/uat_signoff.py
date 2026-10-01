@@ -81,7 +81,7 @@ async def uat_sign_off(
 ) -> Response:
     """Record client UAT acceptance and return the official PVR PDF."""
     client = _supabase()
-    workspace = ensure_owned_workspace(client, body.workspace_id, user.id)
+    workspace = ensure_owned_workspace(client, body.workspace_id, user.id, fresh=True)
     project_name = (body.project_name or workspace.get("name") or "workspace").strip()
     phase_title = phase_export_title(body.phase)
     catalog = get_phase(body.phase)

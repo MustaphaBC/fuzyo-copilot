@@ -44,6 +44,19 @@ class ChatRequest(BaseModel):
     provider_override: str | None = None
     thread_id: str | None = None
     history_window: int = Field(default=6, ge=0, le=10)
+    use_project_context: bool = True
+    prefer_project_files: bool = True
+    use_workspace_knowledge: bool = True
+
+
+class RouteReason(str, Enum):
+    """Why the privacy router picked the target (surfaced to the UI)."""
+
+    FORCE_CONFIDENTIAL = "force_confidential"
+    SECRETS_DETECTED = "secrets_detected"
+    CLASSIFIER_UNAVAILABLE = "classifier_unavailable"
+    SENSITIVITY_THRESHOLD = "sensitivity_threshold"
+    CLOUD_ALLOWED = "cloud_allowed"
 
 
 class RouterDecision(BaseModel):
@@ -55,6 +68,7 @@ class RouterDecision(BaseModel):
     sensitivity_score: float = Field(ge=0.0, le=1.0)
     detected_secrets: list[str] = Field(default_factory=list)
     requires_rag: bool = False
+    route_reason: RouteReason = RouteReason.CLOUD_ALLOWED
 
 
 class QualityScore(BaseModel):

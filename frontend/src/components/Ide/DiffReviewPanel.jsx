@@ -1,35 +1,14 @@
-import { useApp } from '../../context/AppContext'
+import { useEditor } from '../../context/EditorContext'
 import { useUI } from '../../context/UIContext'
+import { useWorkspace } from '../../context/WorkspaceContext'
 import { apiFetch } from '../../lib/api'
+import { buildLineDiff } from '../../lib/lineDiff'
 import { notifyWorkspaceFsUpdated } from '../../lib/saveLocalArtifact'
 
-function buildLineDiff(previous, current) {
-  const a = (previous || '').split('\n')
-  const b = (current || '').split('\n')
-  const max = Math.max(a.length, b.length)
-  const rows = []
-  for (let i = 0; i < max; i += 1) {
-    const left = a[i]
-    const right = b[i]
-    if (left === right) {
-      rows.push({ type: 'same', text: right ?? '' })
-    } else {
-      if (left !== undefined) rows.push({ type: 'del', text: left })
-      if (right !== undefined) rows.push({ type: 'add', text: right })
-    }
-  }
-  return rows
-}
-
 export default function DiffReviewPanel() {
-  const {
-    activeWorkspace,
-    pendingDiff,
-    clearPendingDiff,
-    openIdeFile,
-    updateIdeFileContent,
-    markDirty,
-  } = useApp()
+  const { activeWorkspace } = useWorkspace()
+  const { pendingDiff, clearPendingDiff, openIdeFile, updateIdeFileContent, markDirty } =
+    useEditor()
   const { pushToast } = useUI()
 
   if (!pendingDiff) return null

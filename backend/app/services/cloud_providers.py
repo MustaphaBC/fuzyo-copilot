@@ -229,7 +229,7 @@ class GeminiClient(BaseLLMClient):
 class CerebrasClient(OpenAICompatibleClient):
     provider_name = "cerebras"
     default_base_url = "https://api.cerebras.ai/v1"
-    default_model = "llama3.1-8b"
+    default_model = "qwen-3.8-27b"
 
     def __init__(
         self,

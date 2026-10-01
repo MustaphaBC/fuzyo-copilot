@@ -2,6 +2,10 @@
 @tailwind components;
 @tailwind utilities;
 
+html.density-compact {
+  font-size: 14px;
+}
+
 :root {
   color-scheme: light;
   --app-bg: #fafafa;

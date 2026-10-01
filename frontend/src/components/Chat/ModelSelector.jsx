@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { apiFetch } from '../../lib/api'
 import { useAuth } from '../../context/AuthContext'
-import { useApp } from '../../context/AppContext'
+import { useChatControls } from '../../context/ChatContext'
 
 function optionKey(item) {
   if (!item) return 'auto'
@@ -12,7 +12,7 @@ function optionKey(item) {
 const AUTO_ONLY = [{ provider: 'auto', id: 'auto', label: 'Auto (SDLC routi)' }]
 
 export default function ModelSelector() {
-  const { selectedModelKey, setSelectedModelKey } = useApp()
+  const { selectedModelKey, setSelectedModelKey } = useChatControls()
   const { session, loading: authLoading } = useAuth()
   const [options, setOptions] = useState(AUTO_ONLY)
   const [loadError, setLoadError] = useState(null)

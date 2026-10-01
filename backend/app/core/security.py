@@ -13,13 +13,24 @@ _jwks_client: PyJWKClient | None = None
 _jwks_url_cached: str | None = None
 
 
+class TokenRejectedError(ValueError):
+    """Token is definitively invalid: malformed, unsigned, bad signature, expired, wrong aud."""
+
+
+class LocalVerificationUnavailableError(ValueError):
+    """Signature could not be checked locally (missing key material / unsupported alg).
+
+    Callers may defer to Supabase Auth; the token must not be trusted as-is.
+    """
+
+
 def _get_jwks_client() -> PyJWKClient:
     """Return a module-cached PyJWKClient for the configured Supabase project."""
     global _jwks_client, _jwks_url_cached
 
     base = (settings.supabase_url or "").strip().rstrip("/")
     if not base:
-        raise ValueError("SUPABASE_URL is not configured")
+        raise LocalVerificationUnavailableError("SUPABASE_URL is not configured")
 
     jwks_url = f"{base}/auth/v1/.well-known/jwks.json"
     if _jwks_client is None or _jwks_url_cached != jwks_url:
@@ -31,7 +42,7 @@ def _get_jwks_client() -> PyJWKClient:
 def _unverified_header(token: str) -> dict:
     raw = (token or "").strip()
     if not raw or raw.count(".") < 2:
-        raise ValueError(
+        raise TokenRejectedError(
             "Access token is not a JWT (expected three dot-separated segments). "
             "Sign out and sign in again. "
             "If VITE_E2E_AUTH_BYPASS is enabled, disable it for normal local use."
@@ -39,7 +50,7 @@ def _unverified_header(token: str) -> dict:
     try:
         return jwt.get_unverified_header(raw)
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Invalid token header: {exc}") from exc
+        raise TokenRejectedError(f"Invalid token header: {exc}") from exc
 
 
 def _decode_via_jwks(token: str) -> dict:
@@ -56,11 +67,11 @@ def _decode_via_jwks(token: str) -> dict:
 def _decode_via_hs256(token: str) -> dict:
     secret = (settings.supabase_jwt_secret or "").strip()
     if not secret:
-        raise ValueError("SUPABASE_JWT_SECRET is not configured")
+        raise LocalVerificationUnavailableError("SUPABASE_JWT_SECRET is not configured")
 
     # Project ref from the URL is often pasted by mistake (short alphanumeric).
     if secret.isalnum() and 15 <= len(secret) <= 24 and secret.islower():
-        raise ValueError(
+        raise LocalVerificationUnavailableError(
             "SUPABASE_JWT_SECRET looks like a project ref, not the JWT Secret "
             "(Supabase → Project Settings → API → JWT Secret)"
         )
@@ -88,32 +99,54 @@ def decode_supabase_jwt(token: str) -> dict:
     Falls back to legacy HS256 + SUPABASE_JWT_SECRET when JWKS is unavailable
     or the token is symmetric.
 
+    Failure policy:
+        * ``TokenRejectedError`` — malformed token, ``alg: none``, expired,
+          bad signature / audience from a key we hold (JWKS key for an
+          asymmetric token, configured secret for an HS256 token).
+        * ``LocalVerificationUnavailableError`` — no usable key material
+          (no secret, JWKS unreachable / kid unknown) or an algorithm we
+          cannot verify locally.
+
     Raises:
-        ValueError: missing config or invalid/expired token.
+        ValueError: both error types above subclass it.
     """
     header = _unverified_header(token)
+    alg = str(header.get("alg") or "")
+    if alg.lower() in {"", "none"}:
+        raise TokenRejectedError("Unsigned tokens are not accepted")
+
     jwks_error: Exception | None = None
+    jwks_rejected = False
 
     if _should_try_jwks(header):
         try:
             return _decode_via_jwks(token)
         except ExpiredSignatureError as exc:
-            raise ValueError("Token expired") from exc
-        except (PyJWKClientError, InvalidTokenError, ValueError, OSError) as exc:
+            raise TokenRejectedError("Token expired") from exc
+        except (PyJWKClientError, ValueError, OSError) as exc:
             jwks_error = exc
+        except InvalidTokenError as exc:
+            jwks_error = exc
+            jwks_rejected = alg in _ASYMMETRIC_ALGS
 
     try:
         return _decode_via_hs256(token)
     except ExpiredSignatureError as exc:
-        raise ValueError("Token expired") from exc
+        raise TokenRejectedError("Token expired") from exc
     except InvalidTokenError as exc:
         if jwks_error is not None:
-            raise ValueError(
-                f"Invalid token (JWKS failed: {jwks_error}; HS256 failed: {exc})"
-            ) from exc
-        raise ValueError(f"Invalid token: {exc}") from exc
-    except ValueError:
+            message = f"Invalid token (JWKS failed: {jwks_error}; HS256 failed: {exc})"
+        else:
+            message = f"Invalid token: {exc}"
+        if jwks_rejected or alg == "HS256":
+            raise TokenRejectedError(message) from exc
+        raise LocalVerificationUnavailableError(message) from exc
+    except LocalVerificationUnavailableError as exc:
+        if jwks_rejected:
+            raise TokenRejectedError(f"Invalid token: {jwks_error}") from exc
         # Missing/misconfigured HS256 secret — surface JWKS error if that was tried.
         if jwks_error is not None and not (settings.supabase_jwt_secret or "").strip():
-            raise ValueError(f"JWKS verification failed: {jwks_error}") from jwks_error
+            raise LocalVerificationUnavailableError(
+                f"JWKS verification failed: {jwks_error}"
+            ) from jwks_error
         raise

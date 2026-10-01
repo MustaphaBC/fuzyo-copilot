@@ -65,7 +65,7 @@ def _ensure_thread_owned(client: Any, thread_id: UUID, owner_id: UUID) -> dict[s
     if not rows:
         raise HTTPException(status_code=404, detail="Thread not found")
     row = rows[0]
-    ensure_owned_workspace(client, UUID(str(row["workspace_id"])), owner_id)
+    ensure_owned_workspace(client, UUID(str(row["workspace_id"])), owner_id, fresh=True)
     return row
 
 
@@ -102,7 +102,7 @@ async def create_thread(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> ThreadOut:
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     now = datetime.now(timezone.utc).isoformat()
     thread_id = str(payload.id) if payload.id else str(uuid4())
     row = {

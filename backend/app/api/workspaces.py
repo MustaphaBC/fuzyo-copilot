@@ -6,14 +6,20 @@ import json
 import shutil
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from backend.app.api.deps import CurrentUser, ensure_owned_workspace, get_current_user
+from backend.app.api.deps import (
+    CurrentUser,
+    ensure_owned_workspace,
+    get_current_user,
+    invalidate_workspace,
+)
 from backend.app.core.config import settings
 from backend.app.schemas.workspace import WorkspaceCreate, WorkspaceOut, WorkspaceUpdate
 from backend.app.services.analytics_engine import (
@@ -24,7 +30,7 @@ from backend.app.services.analytics_engine import (
 from backend.app.services.artifact_router import phase_dir, place_artifact, sanitize_basename
 from backend.app.services.project_analyzer import analyze_project
 from backend.app.services.rag_service import ingest_file
-from backend.app.services import workspace_fs
+from backend.app.services import ingest_jobs, workspace_fs
 
 router = APIRouter(tags=["workspaces"])
 
@@ -89,6 +95,7 @@ class CreateAndIngestResult(BaseModel):
     chunks_inserted: int = 0
     skipped_ignored: int = 0
     sdlc_audit_report: dict[str, Any] | None = None
+    job_id: str | None = None
 
 
 class SaveArtifactRequest(BaseModel):
@@ -188,6 +195,8 @@ async def _persist_audit_report(
     except Exception:  # noqa: BLE001
         # Column may be missing until migration 06 is applied
         pass
+    finally:
+        invalidate_workspace(workspace_id)
 
 
 @router.post("/workspaces", response_model=WorkspaceOut)
@@ -228,6 +237,7 @@ async def create_workspace(
 @router.post("/workspaces/create-and-ingest", response_model=CreateAndIngestResult)
 async def create_and_ingest(
     user: Annotated[CurrentUser, Depends(get_current_user)],
+    background_tasks: BackgroundTasks,
     name: str = Form(...),
     description: str | None = Form(None),
     custom_instructions: str | None = Form(None),
@@ -235,10 +245,15 @@ async def create_and_ingest(
     mode: str = Form("docs"),
     sdlc_phase: int = Form(1),
     custom_host_path: str | None = Form(None),
+    async_ingest: bool = Form(False),
     files: list[UploadFile] | None = File(None),
     zip_file: UploadFile | None = File(None),
 ) -> CreateAndIngestResult:
-    """Create a workspace and ingest docs or a filtered codebase archive."""
+    """Create a workspace and ingest docs or a filtered codebase archive.
+
+    With ``async_ingest=true`` the workspace is returned immediately with a
+    ``job_id``; poll ``GET /workspaces/{id}/ingest-jobs/{job_id}`` for progress.
+    """
     trimmed = (name or "").strip()
     if not trimmed:
         raise HTTPException(status_code=400, detail="name is required")
@@ -278,114 +293,200 @@ async def create_and_ingest(
         local_root = None
 
     tmp_root = Path(tempfile.mkdtemp(prefix="fuzyo-ingest-"))
-    skipped = 0
-    files_ingested = 0
-    chunks_inserted = 0
-    source_names: list[str] = []
+    job = ingest_jobs.create_job(workspace_id, user.id)
+    try:
+        staged, skipped = await _stage_uploads(tmp_root, list(files or []), zip_file)
+    except HTTPException:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        ingest_jobs.finish_job(job, error="staging failed")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        ingest_jobs.finish_job(job, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"Create-and-ingest failed: {exc}") from exc
+
+    job.skipped_ignored = skipped
+    job.total_files = len(staged)
+    job.step = "parse"
+    plan = _IngestPlan(
+        workspace_id=workspace_id,
+        owner_id=user.id,
+        tmp_root=tmp_root,
+        staged=staged,
+        phase=phase,
+        mode=mode_norm,
+        local_root=local_root,
+    )
+
+    if async_ingest:
+        background_tasks.add_task(_run_ingest_job, client, plan, job)
+        return CreateAndIngestResult(
+            workspace=_row_to_workspace(workspace_row),
+            skipped_ignored=skipped,
+            job_id=job.id,
+        )
 
     try:
-        upload_list = list(files or [])
-        if zip_file is not None and (zip_file.filename or "").strip():
-            zip_path = tmp_root / "upload.zip"
-            with zip_path.open("wb") as handle:
-                while True:
-                    chunk = await zip_file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
-            extract_dir = tmp_root / "extracted"
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            try:
-                with zipfile.ZipFile(zip_path, "r") as archive:
-                    for info in archive.infolist():
-                        if info.is_dir():
-                            continue
-                        rel = info.filename.replace("\\", "/")
-                        if _should_ignore_path(rel):
-                            skipped += 1
-                            continue
-                        suffix = Path(rel).suffix.lower()
-                        if suffix not in _ALLOWED_UPLOAD_SUFFIXES:
-                            skipped += 1
-                            continue
-                        target = extract_dir / rel
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        with archive.open(info) as src, target.open("wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        inserted = await ingest_file(workspace_id, target, sdlc_phase=phase)
-                        if inserted:
-                            files_ingested += 1
-                            chunks_inserted += inserted
-                            source_names.append(rel)
-            except zipfile.BadZipFile as exc:
-                raise HTTPException(status_code=400, detail="Invalid zip archive") from exc
-            finally:
-                await zip_file.close()
+        report = await _run_ingest_plan(client, plan, job)
+    except Exception as exc:  # noqa: BLE001
+        ingest_jobs.finish_job(job, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"Create-and-ingest failed: {exc}") from exc
+    ingest_jobs.finish_job(job)
+    workspace_row["sdlc_audit_report"] = report
+    return CreateAndIngestResult(
+        workspace=_row_to_workspace(workspace_row),
+        files_ingested=job.files_ingested,
+        chunks_inserted=job.chunks_inserted,
+        skipped_ignored=skipped,
+        sdlc_audit_report=report,
+    )
 
-        for upload in upload_list:
-            original = Path(upload.filename or "upload.bin").name
-            rel = (upload.filename or original).replace("\\", "/")
-            if _should_ignore_path(rel):
-                skipped += 1
-                await upload.close()
-                continue
-            suffix = Path(rel).suffix.lower()
-            if suffix not in _ALLOWED_UPLOAD_SUFFIXES:
-                skipped += 1
-                await upload.close()
-                continue
-            dest = tmp_root / "files" / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with dest.open("wb") as handle:
-                while True:
-                    chunk = await upload.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    handle.write(chunk)
+
+@dataclass(frozen=True, slots=True)
+class _IngestPlan:
+    workspace_id: UUID
+    owner_id: UUID
+    tmp_root: Path
+    staged: list[tuple[str, Path]]
+    phase: int
+    mode: str
+    local_root: Path | None
+
+
+async def _copy_upload(upload: UploadFile, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("wb") as handle:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            handle.write(chunk)
+
+
+def _is_ingestible(rel: str) -> bool:
+    return not _should_ignore_path(rel) and Path(rel).suffix.lower() in _ALLOWED_UPLOAD_SUFFIXES
+
+
+async def _stage_uploads(
+    tmp_root: Path,
+    upload_list: list[UploadFile],
+    zip_file: UploadFile | None,
+) -> tuple[list[tuple[str, Path]], int]:
+    """Copy uploads/zip members into tmp_root, filtering ignored/unsupported files."""
+    staged: list[tuple[str, Path]] = []
+    skipped = 0
+
+    if zip_file is not None and (zip_file.filename or "").strip():
+        zip_path = tmp_root / "upload.zip"
+        try:
+            await _copy_upload(zip_file, zip_path)
+        finally:
+            await zip_file.close()
+        extract_dir = tmp_root / "extracted"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    rel = info.filename.replace("\\", "/")
+                    if not _is_ingestible(rel):
+                        skipped += 1
+                        continue
+                    try:
+                        target = workspace_fs.safe_join(extract_dir, rel)
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as src, target.open("wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    staged.append((rel, target))
+        except zipfile.BadZipFile as exc:
+            raise HTTPException(status_code=400, detail="Invalid zip archive") from exc
+
+    files_dir = tmp_root / "files"
+    for upload in upload_list:
+        original = Path(upload.filename or "upload.bin").name
+        rel = (upload.filename or original).replace("\\", "/")
+        if not _is_ingestible(rel):
+            skipped += 1
             await upload.close()
-            inserted = await ingest_file(workspace_id, dest, sdlc_phase=phase)
+            continue
+        try:
+            dest = workspace_fs.safe_join(files_dir, rel)
+        except ValueError:
+            skipped += 1
+            await upload.close()
+            continue
+        try:
+            await _copy_upload(upload, dest)
+        finally:
+            await upload.close()
+        staged.append((rel, dest))
+
+    return staged, skipped
+
+
+async def _run_ingest_plan(client: Any, plan: _IngestPlan, job: ingest_jobs.IngestJob) -> dict[str, Any]:
+    """Embed + index staged files, mirror to host, scan; updates job progress."""
+    source_names: list[str] = []
+    try:
+        for rel, path in plan.staged:
+            job.current_file = rel
+            job.step = "embed"
+            inserted = await ingest_file(
+                plan.workspace_id, path, sdlc_phase=plan.phase, display_name=rel
+            )
+            job.processed_files += 1
             if inserted:
-                files_ingested += 1
-                chunks_inserted += inserted
+                job.step = "index"
+                job.files_ingested += 1
+                job.chunks_inserted += inserted
                 source_names.append(rel)
 
-        tree_root = None
-        extracted = tmp_root / "extracted"
-        files_dir = tmp_root / "files"
-        if extracted.exists():
-            tree_root = extracted
-        elif files_dir.exists():
-            tree_root = files_dir
+        job.step = "scan"
+        job.current_file = None
+        extracted = plan.tmp_root / "extracted"
+        files_dir = plan.tmp_root / "files"
+        tree_root = extracted if extracted.exists() else files_dir if files_dir.exists() else None
 
-        if local_root is not None and tree_root is not None:
-            under = "src" if mode_norm == "codebase" else phase_dir(phase)
+        if plan.local_root is not None and tree_root is not None:
+            under = "src" if plan.mode == "codebase" else phase_dir(plan.phase)
             try:
-                workspace_fs.materialize_upload_tree(
-                    local_root, tree_root, under=under
-                )
+                workspace_fs.materialize_upload_tree(plan.local_root, tree_root, under=under)
             except OSError:
                 pass
-            report = analyze_project(source_names=source_names, root=local_root)
+            report = analyze_project(source_names=source_names, root=plan.local_root)
         else:
             report = analyze_project(source_names=source_names, root=tree_root)
 
-        await _persist_audit_report(client, workspace_id, user.id, report)
-        invalidate_analytics_cache(workspace_id)
-        workspace_row["sdlc_audit_report"] = report
-
-        return CreateAndIngestResult(
-            workspace=_row_to_workspace(workspace_row),
-            files_ingested=files_ingested,
-            chunks_inserted=chunks_inserted,
-            skipped_ignored=skipped,
-            sdlc_audit_report=report,
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Create-and-ingest failed: {exc}") from exc
+        await _persist_audit_report(client, plan.workspace_id, plan.owner_id, report)
+        invalidate_analytics_cache(plan.workspace_id)
+        return report
     finally:
-        shutil.rmtree(tmp_root, ignore_errors=True)
+        shutil.rmtree(plan.tmp_root, ignore_errors=True)
+
+
+async def _run_ingest_job(client: Any, plan: _IngestPlan, job: ingest_jobs.IngestJob) -> None:
+    try:
+        await _run_ingest_plan(client, plan, job)
+    except Exception as exc:  # noqa: BLE001
+        ingest_jobs.finish_job(job, error=str(exc))
+        return
+    ingest_jobs.finish_job(job)
+
+
+@router.get("/workspaces/{workspace_id}/ingest-jobs/{job_id}")
+async def get_ingest_job(
+    workspace_id: UUID,
+    job_id: str,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+) -> dict[str, Any]:
+    job = ingest_jobs.get_job(job_id, owner_id=user.id, workspace_id=workspace_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Ingest job not found")
+    return job.to_dict()
 
 
 @router.get("/workspaces", response_model=list[WorkspaceOut])
@@ -413,10 +514,10 @@ async def update_workspace(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> WorkspaceOut:
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    current = ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
-        return _row_to_workspace(ensure_owned_workspace(client, workspace_id, user.id))
+        return _row_to_workspace(current)
     try:
         result = (
             client.table("workspaces")
@@ -427,6 +528,8 @@ async def update_workspace(
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Supabase update failed: {exc}") from exc
+    finally:
+        invalidate_workspace(workspace_id)
     data = result.data or []
     if not data:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -440,7 +543,7 @@ async def delete_workspace(
 ) -> DeleteResult:
     """Delete workspace; document_chunks are purged via ON DELETE CASCADE."""
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
 
     purged = 0
     try:
@@ -460,6 +563,8 @@ async def delete_workspace(
         ).execute()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Supabase delete failed: {exc}") from exc
+    finally:
+        invalidate_workspace(workspace_id)
 
     invalidate_analytics_cache(workspace_id)
     return DeleteResult(status="deleted", id=workspace_id, purged_chunks=purged)
@@ -476,7 +581,7 @@ async def upload_workspace_document(
     sdlc_phase: int = Form(1),
 ) -> DocumentUploadResult:
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
 
     original_name = Path(file.filename or "upload.bin").name
     suffix = Path(original_name).suffix.lower()
@@ -498,7 +603,9 @@ async def upload_workspace_document(
                     break
                 tmp.write(chunk)
 
-        inserted = await ingest_file(workspace_id, tmp_path, sdlc_phase=phase)
+        inserted = await ingest_file(
+            workspace_id, tmp_path, sdlc_phase=phase, display_name=original_name
+        )
         invalidate_analytics_cache(workspace_id)
         # Best-effort local mirror into phase folder.
         try:
@@ -533,7 +640,7 @@ async def save_workspace_artifact(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> SaveArtifactResult:
     client = _supabase()
-    workspace = ensure_owned_workspace(client, workspace_id, user.id)
+    workspace = ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     try:
         placed = place_artifact(
             workspace_id,
@@ -592,7 +699,7 @@ async def apply_workspace_changes(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> ApplyChangesResult:
     client = _supabase()
-    workspace = ensure_owned_workspace(client, workspace_id, user.id)
+    workspace = ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     name = workspace.get("name") or "workspace"
     root = workspace_fs.ensure_workspace_root(name, workspace_id)
     phase = payload.phase if payload.phase is not None else 5
@@ -613,7 +720,9 @@ async def apply_workspace_changes(
         written.append(relative)
         # Best-effort RAG re-index for text-like files
         try:
-            inserted = await ingest_file(workspace_id, target, sdlc_phase=phase)
+            inserted = await ingest_file(
+                workspace_id, target, sdlc_phase=phase, display_name=relative
+            )
             if inserted:
                 ingested += 1
         except Exception:  # noqa: BLE001
@@ -635,7 +744,9 @@ async def apply_workspace_changes(
 async def workspace_analytics(
     workspace_id: UUID,
     user: Annotated[CurrentUser, Depends(get_current_user)],
+    refresh: bool = False,
 ) -> WorkspaceAnalytics:
+    """Workspace KPIs; ``refresh=true`` re-scans the local tree before aggregating."""
     client = _supabase()
     try:
         workspace = ensure_owned_workspace(client, workspace_id, user.id)
@@ -646,5 +757,18 @@ async def workspace_analytics(
             raise HTTPException(status_code=503, detail="Supabase unreachable") from exc
         raise
 
-    payload = await build_workspace_analytics(client, workspace, user.id)
+    if refresh:
+        try:
+            root = workspace_fs.ensure_workspace_root(
+                workspace.get("name") or "workspace", workspace_id
+            )
+            report = analyze_project(root=root)
+            await _persist_audit_report(client, workspace_id, user.id, report)
+            workspace["sdlc_audit_report"] = report
+        except OSError:
+            pass
+
+    payload = await build_workspace_analytics(
+        client, workspace, user.id, force_refresh=refresh
+    )
     return WorkspaceAnalytics(**payload)

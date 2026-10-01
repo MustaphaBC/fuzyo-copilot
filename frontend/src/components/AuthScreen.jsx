@@ -9,7 +9,7 @@ const ROLE_OPTIONS = [
 ]
 
 export default function AuthScreen() {
-  const { signIn, signUp, configured } = useAuth()
+  const { signIn, signUp, configured, sessionExpired } = useAuth()
   const [mode, setMode] = useState('signin')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -58,6 +58,16 @@ export default function AuthScreen() {
             {mode === 'signin' ? 'Sign in to continue' : 'Create your account'}
           </p>
         </div>
+
+        {sessionExpired && (
+          <p
+            className="mb-4 rounded-lg border border-amber-500/40 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-800/50 dark:bg-amber-950/30 dark:text-amber-200"
+            role="alert"
+            data-testid="session-expired-banner"
+          >
+            Your session expired. Sign in again to return to the page you were on.
+          </p>
+        )}
 
         {!configured && (
           <p className="mb-4 rounded-lg border border-amber-800/50 bg-amber-950/30 px-3 py-2 text-sm text-amber-200">

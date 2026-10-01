@@ -7,14 +7,20 @@ import {
   ShieldOff,
 } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { parseSelectedModelKey, SDLC_PHASES, useApp } from '../context/AppContext'
+import { useChat, useChatControls } from '../context/ChatContext'
+import { useWorkspace } from '../context/WorkspaceContext'
 import { useAutoScroll } from '../hooks/useAutoScroll'
 import { apiFetch } from '../lib/api'
+import { parseSelectedModelKey, SDLC_PHASES } from '../lib/chatConfig'
+import { readChatPrefs } from '../lib/userSettings'
 import ModelSelector from './Chat/ModelSelector'
 import CanvasDrawer, { detectArtifacts } from './CanvasDrawer'
 import EmptyState from './UI/EmptyState'
+import ForceConfidentialModal from './UI/ForceConfidentialModal'
 import InspectorDrawer from './InspectorDrawer'
 import MessageItem from './MessageItem'
+
+const DRAFT_STORAGE_KEY = 'fuzyo:composer-draft'
 
 const SKILL_CHIPS = [
   { id: 'plan', label: 'plan' },
@@ -36,6 +42,31 @@ function buildPrompt(raw, skillsMode) {
   const text = raw.trim()
   if (!skillsMode) return text
   return `/${skillsMode}\n\n${text}`
+}
+
+function routingNotice(event) {
+  if (event.target_client !== 'LOCAL_STUB') return null
+  const reason = event.route_reason
+  if (reason === 'secrets_detected' || (!reason && event.detected_secrets?.length)) {
+    return { kind: 'sensitive', secrets: event.detected_secrets ?? [] }
+  }
+  if (reason === 'classifier_unavailable') {
+    return { kind: 'classifier_unavailable' }
+  }
+  return null
+}
+
+async function rateLimitNotice(response) {
+  let retryAfter = Number(response.headers.get('Retry-After')) || 0
+  let message = ''
+  try {
+    const data = await response.json()
+    if (Number(data?.retry_after) > 0) retryAfter = Number(data.retry_after)
+    message = typeof data?.detail === 'string' ? data.detail : ''
+  } catch {
+    /* non-JSON body */
+  }
+  return { kind: 'rate_limit', retryAfter: retryAfter || 30, message }
 }
 
 async function consumeSse(response, handlers, signal) {
@@ -137,11 +168,20 @@ function Composer({
     setSkillsMode,
     inputMode,
     setInputMode,
-    activeWorkspace,
-  } = useApp()
+  } = useChatControls()
+  const { activeWorkspace } = useWorkspace()
 
   const phase = SDLC_PHASES.find((item) => item.id === sdlcPhase)
   const textareaRef = useRef(null)
+  const [confirmConfidential, setConfirmConfidential] = useState(false)
+
+  const toggleConfidential = () => {
+    if (forceConfidential) {
+      setForceConfidential(false)
+    } else {
+      setConfirmConfidential(true)
+    }
+  }
 
   useEffect(() => {
     if (!collapsed) {
@@ -290,7 +330,7 @@ function Composer({
             aria-label={
               forceConfidential ? 'Confidential ON' : 'Confidential OFF'
             }
-            onClick={() => setForceConfidential(!forceConfidential)}
+            onClick={toggleConfidential}
             className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs transition ${
               forceConfidential
                 ? 'border-emerald-700/60 bg-emerald-950/40 text-emerald-300'
@@ -362,6 +402,15 @@ function Composer({
           {uploadError || 'Uploading document…'}
         </p>
       )}
+
+      <ForceConfidentialModal
+        open={confirmConfidential}
+        onCancel={() => setConfirmConfidential(false)}
+        onConfirm={() => {
+          setForceConfidential(true)
+          setConfirmConfidential(false)
+        }}
+      />
     </div>
   )
 }
@@ -370,7 +419,6 @@ export default function ChatContainer() {
   const {
     sdlcPhase,
     forceConfidential,
-    activeWorkspace,
     skillsMode,
     messages,
     setMessages,
@@ -379,9 +427,18 @@ export default function ChatContainer() {
     activeThreadId,
     persistThreadMessagesToServer,
     composerSeed,
-  } = useApp()
+    seedComposer,
+    aiBehavior,
+  } = useChat()
+  const { activeWorkspace, viewMode } = useWorkspace()
 
-  const [input, setInput] = useState('')
+  const [input, setInput] = useState(() => {
+    try {
+      return sessionStorage.getItem(DRAFT_STORAGE_KEY) || ''
+    } catch {
+      return ''
+    }
+  })
   const [streaming, setStreaming] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(false)
   const [canvasOpen, setCanvasOpen] = useState(false)
@@ -401,9 +458,18 @@ export default function ChatContainer() {
     SDLC_PHASES.find((item) => item.id === sdlcPhase)?.label ?? 'SDLC'
 
   useEffect(() => {
-    if (!composerSeed?.text) return
+    if (!composerSeed?.text || composerSeed.autoSend) return
     setInput(composerSeed.text)
   }, [composerSeed])
+
+  useEffect(() => {
+    try {
+      if (input) sessionStorage.setItem(DRAFT_STORAGE_KEY, input)
+      else sessionStorage.removeItem(DRAFT_STORAGE_KEY)
+    } catch {
+      /* storage unavailable */
+    }
+  }, [input])
 
   useEffect(() => {
     const latestAssistant = [...messages].reverse().find((msg) => msg.role === 'assistant')
@@ -411,7 +477,7 @@ export default function ChatContainer() {
     if (!hasVisualArtifacts(latestAssistant.content)) return
     setCanvasContent(latestAssistant.content)
     if (!latestAssistant.isStreaming) {
-      setCanvasOpen(true)
+      if (readChatPrefs().autoOpenCanvas) setCanvasOpen(true)
       if (!savedArtifactIds.current.has(latestAssistant.id)) {
         savedArtifactIds.current.add(latestAssistant.id)
         appendArtifact(latestAssistant.content)
@@ -454,17 +520,33 @@ export default function ChatContainer() {
       abortRef.current = controller
 
       setStreaming(true)
-      setInspectorOpen(true)
+      if (readChatPrefs().autoOpenInspector) setInspectorOpen(true)
       setMeta({
         routing: null,
         rag: null,
         quality: null,
         skill: null,
         retry: null,
+        fallback: null,
         tokenCount: 0,
         latencyMs: null,
         startedAt,
+        stopped: false,
+        error: null,
       })
+
+      const patchAssistant = (patch) => {
+        setMessages((prev) =>
+          prev.map((msg) =>
+            msg.id === assistantId
+              ? { ...msg, ...(typeof patch === 'function' ? patch(msg) : patch) }
+              : msg,
+          ),
+        )
+      }
+      const addNotice = (notice) => {
+        patchAssistant((msg) => ({ notices: [...(msg.notices ?? []), notice] }))
+      }
 
       const withAssistant = [
         ...historyMessages,
@@ -485,6 +567,9 @@ export default function ChatContainer() {
           force_confidential: forceConfidential,
           workspace_id: activeWorkspace?.id ?? null,
           history_window: 6,
+          use_project_context: aiBehavior.useProjectContext,
+          prefer_project_files: aiBehavior.preferProjectFiles,
+          use_workspace_knowledge: aiBehavior.useWorkspaceKnowledge,
         }
         if (activeThreadId) {
           body.thread_id = activeThreadId
@@ -502,6 +587,12 @@ export default function ChatContainer() {
           signal: controller.signal,
         })
 
+        if (response.status === 429) {
+          const notice = await rateLimitNotice(response)
+          addNotice(notice)
+          setMeta((prev) => (prev ? { ...prev, error: 'rate_limit' } : prev))
+          return
+        }
         if (!response.ok) {
           const detail = await response.text()
           throw new Error(detail || `HTTP ${response.status}`)
@@ -529,17 +620,30 @@ export default function ChatContainer() {
               }
               if (event.type === 'routing') {
                 setMeta((prev) => ({ ...prev, routing: event }))
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === assistantId
-                      ? { ...msg, routingBadge: event.target_client }
-                      : msg,
-                  ),
-                )
+                patchAssistant({ routingBadge: event.target_client })
+                const notice = routingNotice(event)
+                if (notice) addNotice(notice)
                 return
               }
               if (event.type === 'rag') {
                 setMeta((prev) => ({ ...prev, rag: event }))
+                if (event.status === 'degraded_bm25') {
+                  addNotice({ kind: 'degraded_rag', hitCount: event.hit_count })
+                }
+                return
+              }
+              if (event.type === 'fallback') {
+                setMeta((prev) => ({ ...prev, fallback: event }))
+                addNotice({
+                  kind: 'fallback',
+                  fromProvider: event.from_provider,
+                  toProvider: event.to_provider,
+                  target: event.target,
+                  reason: event.reason,
+                })
+                if (event.target === 'LOCAL') {
+                  patchAssistant({ routingBadge: 'LOCAL_STUB' })
+                }
                 return
               }
               if (event.type === 'skill') {
@@ -548,13 +652,11 @@ export default function ChatContainer() {
               }
               if (event.type === 'retry') {
                 setMeta((prev) => ({ ...prev, retry: event }))
-                setMessages((prev) =>
-                  prev.map((msg) =>
-                    msg.id === assistantId
-                      ? { ...msg, isRetrying: true, retryScore: event.attempt_score }
-                      : msg,
-                  ),
-                )
+                patchAssistant({
+                  isRetrying: true,
+                  retryScore: event.attempt_score,
+                  retryAttempt: event.attempt,
+                })
                 return
               }
               if (event.type === 'token') {
@@ -594,28 +696,12 @@ export default function ChatContainer() {
         )
       } catch (error) {
         if (error?.name === 'AbortError') {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantId
-                ? {
-                    ...msg,
-                    content: msg.content || '[stopped]',
-                  }
-                : msg,
-            ),
-          )
+          setMeta((prev) => (prev ? { ...prev, stopped: true } : prev))
+          patchAssistant((msg) => ({ content: msg.content || '[stopped]' }))
         } else {
           const message = error instanceof Error ? error.message : 'Stream failed'
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantId
-                ? {
-                    ...msg,
-                    content: msg.content || `[error] ${message}`,
-                  }
-                : msg,
-            ),
-          )
+          setMeta((prev) => (prev ? { ...prev, error: message } : prev))
+          addNotice({ kind: 'error', message })
         }
       } finally {
         setMessages((prev) => {
@@ -650,6 +736,7 @@ export default function ChatContainer() {
     [
       activeThreadId,
       activeWorkspace?.id,
+      aiBehavior,
       forceConfidential,
       selectedModelKey,
       persistThreadMessagesToServer,
@@ -659,16 +746,36 @@ export default function ChatContainer() {
     ],
   )
 
-  const handleSend = async () => {
-    const raw = input.trim()
+  const sendText = async (text) => {
+    const raw = String(text || '').trim()
     if (!raw || streaming) return
     const userMessage = { id: crypto.randomUUID(), role: 'user', content: raw }
-    setInput('')
     await runCompletion({
       historyMessages: [...messages, userMessage],
       userRaw: raw,
     })
   }
+
+  const handleSend = async () => {
+    const raw = input.trim()
+    if (!raw || streaming) return
+    setInput('')
+    await sendText(raw)
+  }
+
+  const sendTextRef = useRef(sendText)
+  useEffect(() => {
+    sendTextRef.current = sendText
+  })
+  const autoSentNonceRef = useRef(null)
+  useEffect(() => {
+    if (!composerSeed?.autoSend || !composerSeed.text) return
+    if (autoSentNonceRef.current === composerSeed.nonce) return
+    autoSentNonceRef.current = composerSeed.nonce
+    const text = composerSeed.text
+    seedComposer('')
+    void sendTextRef.current(text)
+  }, [composerSeed, seedComposer])
 
   const handleStop = () => {
     abortRef.current?.abort()
@@ -741,8 +848,13 @@ export default function ChatContainer() {
     onExpand: expandComposer,
   }
 
-  return (
-    <div className="relative flex h-full min-h-0 min-w-0 w-full flex-1 flex-col overflow-x-hidden" data-testid="chat-container">
+  const chatColumn = (
+    <div className="relative flex h-full min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden" data-testid="chat-container">
+      {!isEmpty ? (
+        <div className="shrink-0 border-b border-[var(--border)] px-4 py-1.5 text-[11px] font-medium uppercase tracking-wide text-[var(--muted)]" data-testid="conversation-phase-header">
+          Phase {String(sdlcPhase).padStart(2, '0')} — {phaseLabel}
+        </div>
+      ) : null}
       {isEmpty ? (
         <>
           <div className="flex min-h-0 min-w-0 flex-1 flex-col items-center justify-center overflow-y-auto px-4 py-6">
@@ -773,6 +885,8 @@ export default function ChatContainer() {
                 isStreaming={msg.isStreaming}
                 isRetrying={msg.isRetrying}
                 retryScore={msg.retryScore}
+                retryAttempt={msg.retryAttempt}
+                notices={msg.notices}
                 onEditUser={handleEditUser}
                 onRegenerate={handleRegenerate}
                 messages={messages}
@@ -804,15 +918,23 @@ export default function ChatContainer() {
         </>
       )}
 
-      <InspectorDrawer
-        open={inspectorOpen}
-        onClose={() => setInspectorOpen(false)}
-        meta={meta}
-      />
       <CanvasDrawer
         open={canvasOpen}
         onClose={() => setCanvasOpen(false)}
         content={canvasContent}
+      />
+    </div>
+  )
+
+  return (
+    <div className="relative flex h-full min-h-0 min-w-0 w-full flex-1 overflow-x-hidden">
+      {chatColumn}
+      <InspectorDrawer
+        open={inspectorOpen}
+        onClose={() => setInspectorOpen(false)}
+        meta={meta}
+        streaming={streaming}
+        docked={viewMode === 'chat' && !canvasOpen}
       />
     </div>
   )

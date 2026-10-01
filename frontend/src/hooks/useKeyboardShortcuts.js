@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
-import { useApp } from '../context/AppContext'
+import { useChatControls } from '../context/ChatContext'
+import { usePreferences } from '../context/PreferencesContext'
 import { useUI } from '../context/UIContext'
 
 function isEditableTarget(target) {
@@ -16,7 +17,8 @@ export function useKeyboardShortcuts() {
     setShortcutGuideOpen,
     setMobileSidebarOpen,
   } = useUI()
-  const { resetChat, toggleAppearance } = useApp()
+  const { resetChat } = useChatControls()
+  const { toggleAppearance } = usePreferences()
 
   useEffect(() => {
     function onKeyDown(event) {

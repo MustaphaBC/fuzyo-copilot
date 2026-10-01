@@ -1,8 +1,8 @@
 import { X } from 'lucide-react'
-import { useApp } from '../../context/AppContext'
+import { useEditor } from '../../context/EditorContext'
 
 export default function EditorTabBar() {
-  const { openFiles, activeFilePath, setActiveFile, closeIdeFile } = useApp()
+  const { openFiles, activeFilePath, setActiveFile, closeIdeFile } = useEditor()
 
   if (!openFiles.length) return null
 

@@ -102,7 +102,7 @@ async def put_workspace_fs_file(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> PutFileResult:
     client = _supabase()
-    workspace = ensure_owned_workspace(client, workspace_id, user.id)
+    workspace = ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     root = _require_root(workspace, workspace_id)
     try:
         written = workspace_fs.write_file(root, payload.path, payload.content or "")
@@ -113,7 +113,12 @@ async def put_workspace_fs_file(
 
     invalidate_analytics_cache(workspace_id)
     try:
-        await ingest_file(workspace_id, written, sdlc_phase=5)
+        await ingest_file(
+            workspace_id,
+            written,
+            sdlc_phase=5,
+            display_name=payload.path.replace("\\", "/"),
+        )
     except Exception:  # noqa: BLE001
         pass
 

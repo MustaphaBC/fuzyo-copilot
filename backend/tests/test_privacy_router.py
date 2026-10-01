@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from backend.app.schemas.chat import ChatRequest, SdlcPhase, TargetClient
+from backend.app.schemas.chat import ChatRequest, RouteReason, SdlcPhase, TargetClient
 from backend.app.services.privacy_router import (
+    _CEREBRAS_URL,
+    _GROQ_URL,
     _parse_sensitivity_score,
     route_prompt,
     scan_secrets,
@@ -216,3 +218,70 @@ def test_unparseable_classifier_payload_fail_closed(
         decision = _run(route_prompt(_request()))
     assert decision.target_client == TargetClient.LOCAL_STUB
     assert decision.sensitivity_score == 1.0
+
+
+def _status_response(status_code: int) -> MagicMock:
+    response = MagicMock()
+    response.status_code = status_code
+    return response
+
+
+def _enable_groq_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    for attr, value in (
+        ("force_local_mock", False),
+        ("cerebras_api_key", "cerebras-key"),
+        ("groq_api_key", "groq-key"),
+        ("privacy_classifier_fallback_provider", "groq"),
+    ):
+        monkeypatch.setattr(f"backend.app.services.privacy_router.settings.{attr}", value)
+
+
+def test_cerebras_billing_error_falls_back_to_groq_and_opens_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_groq_fallback(monkeypatch)
+
+    async def post(url: str, **_: Any) -> MagicMock:
+        if url == _CEREBRAS_URL:
+            return _status_response(402)
+        return _ok_response('{"sensitivity_score": 0.1}')
+
+    mock_post = AsyncMock(side_effect=post)
+    with patch(
+        "backend.app.services.privacy_router.httpx.AsyncClient",
+        return_value=_mock_async_client(mock_post),
+    ):
+        first = _run(route_prompt(_request()))
+        second = _run(route_prompt(_request()))
+
+    assert first.target_client == TargetClient.CLOUD_API
+    assert second.target_client == TargetClient.CLOUD_API
+    called_urls = [call.args[0] for call in mock_post.call_args_list]
+    assert called_urls == [_CEREBRAS_URL, _GROQ_URL, _GROQ_URL]
+
+
+def test_all_classifiers_failing_stays_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_groq_fallback(monkeypatch)
+    post = AsyncMock(side_effect=httpx.ConnectTimeout("connect timed out"))
+    with patch(
+        "backend.app.services.privacy_router.httpx.AsyncClient",
+        return_value=_mock_async_client(post),
+    ):
+        decision = _run(route_prompt(_request()))
+    assert decision.target_client == TargetClient.LOCAL_STUB
+    assert decision.route_reason == RouteReason.CLASSIFIER_UNAVAILABLE
+    assert post.await_count == 2
+
+
+def test_secrets_never_reach_fallback_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_groq_fallback(monkeypatch)
+    post = AsyncMock(return_value=_ok_response('{"sensitivity_score": 0.0}'))
+    with patch(
+        "backend.app.services.privacy_router.httpx.AsyncClient",
+        return_value=_mock_async_client(post),
+    ):
+        decision = _run(
+            route_prompt(_request("Deploy with key sk-abcdefghijklmnopqrstuvwxyz012345"))
+        )
+    assert decision.route_reason == RouteReason.SECRETS_DETECTED
+    post.assert_not_awaited()

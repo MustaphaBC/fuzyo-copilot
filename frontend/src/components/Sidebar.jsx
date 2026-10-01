@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useApp } from '../context/AppContext'
 import { useAuth } from '../context/AuthContext'
+import { useChat } from '../context/ChatContext'
+import { usePreferences } from '../context/PreferencesContext'
 import { useUI } from '../context/UIContext'
+import { useWorkspace } from '../context/WorkspaceContext'
 import SidebarSearch from './Sidebar/SidebarSearch'
 import DeleteConfirmModal from './UI/DeleteConfirmModal'
 import ExportModal from './UI/ExportModal'
@@ -75,6 +77,29 @@ function IconMenu({ className = 'h-4 w-4' }) {
   )
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000
+
+function groupThreadsByDate(threads, now = Date.now()) {
+  const startOfToday = new Date(now)
+  startOfToday.setHours(0, 0, 0, 0)
+  const today = startOfToday.getTime()
+  const groups = [
+    { id: 'today', label: 'Today', items: [] },
+    { id: 'yesterday', label: 'Yesterday', items: [] },
+    { id: 'week', label: 'Previous 7 days', items: [] },
+    { id: 'older', label: 'Older', items: [] },
+  ]
+  for (const thread of threads) {
+    const ts = Number(thread.updatedAt) || 0
+    if (ts >= today) groups[0].items.push(thread)
+    else if (ts >= today - DAY_MS) groups[1].items.push(thread)
+    else if (ts >= today - 7 * DAY_MS) groups[2].items.push(thread)
+    else groups[3].items.push(thread)
+  }
+  for (const group of groups) group.items.sort((a, b) => b.updatedAt - a.updatedAt)
+  return groups.filter((group) => group.items.length > 0)
+}
+
 function formatRelative(ts) {
   if (!ts) return ''
   const diff = Math.max(0, Date.now() - Number(ts))
@@ -93,24 +118,24 @@ export default function Sidebar() {
     workspaces,
     workspacesLoading,
     activeWorkspace,
-    setActiveWorkspace,
+    openProject,
     openWorkspaceInIde,
     viewMode,
     setViewMode,
     openWorkspaceModal,
     deleteWorkspace,
+  } = useWorkspace()
+  const {
     resetChat,
     threads,
     activeThreadId,
     selectThread,
-    apiHealthy,
-    appearance,
-    toggleAppearance,
     deleteThread,
     toggleThreadPin,
     messages,
-  } = useApp()
-  const { user, signOut } = useAuth()
+  } = useChat()
+  const { apiHealthy, resolvedAppearance, toggleAppearance } = usePreferences()
+  const { user } = useAuth()
   const {
     sidebarCollapsed,
     toggleSidebarCollapsed,
@@ -147,8 +172,7 @@ export default function Sidebar() {
   }, [projectsMenuOpen])
 
   const openProjectAnalytics = (ws) => {
-    setActiveWorkspace(ws)
-    setViewMode('dashboard')
+    openProject(ws, 'overview')
     setProjectsMenuOpen(false)
     setMobileSidebarOpen(false)
   }
@@ -168,7 +192,10 @@ export default function Sidebar() {
   }, [threads, threadQuery])
 
   const pinned = filteredThreads.filter((t) => t.isPinned)
-  const recent = filteredThreads.filter((t) => !t.isPinned)
+  const dateGroups = useMemo(
+    () => groupThreadsByDate(filteredThreads.filter((t) => !t.isPinned)),
+    [filteredThreads],
+  )
 
   async function confirmWorkspaceDelete() {
     if (!confirmWorkspaceId) return
@@ -320,7 +347,9 @@ export default function Sidebar() {
                   aria-expanded={projectsMenuOpen}
                   aria-haspopup="listbox"
                   onClick={() => setProjectsMenuOpen((open) => !open)}
-                  className={navBtn(projectsMenuOpen || viewMode === 'dashboard')}
+                  className={navBtn(
+                    projectsMenuOpen || viewMode === 'dashboard' || viewMode === 'projects',
+                  )}
                 >
                   <IconFolder />
                   {!collapsed && 'Projects'}
@@ -337,6 +366,19 @@ export default function Sidebar() {
                       : 'left-0 right-0 w-full min-w-[12rem]'
                   }`}
                 >
+                  <button
+                    type="button"
+                    data-testid="projects-picker-all"
+                    onClick={() => {
+                      setProjectsMenuOpen(false)
+                      setViewMode('projects')
+                      setMobileSidebarOpen(false)
+                    }}
+                    className="flex w-full px-3 py-2 text-left text-sm font-medium text-[var(--app-fg)] hover:bg-[var(--hover)]"
+                  >
+                    All projects
+                  </button>
+                  <div className="my-1 border-t border-[var(--border)]" />
                   {workspacesLoading ? (
                     <p className="px-3 py-2 text-xs text-[var(--muted)]">Loading…</p>
                   ) : null}
@@ -398,13 +440,11 @@ export default function Sidebar() {
               <button
                 type="button"
                 onClick={() => {
-                  if (!activeWorkspace) return
-                  setViewMode('customize')
-                  openWorkspaceModal('edit')
+                  setViewMode('settings')
                   setMobileSidebarOpen(false)
                 }}
-                disabled={!activeWorkspace}
-                className={`${navBtn(viewMode === 'customize')} disabled:cursor-not-allowed disabled:opacity-40`}
+                className={navBtn(viewMode === 'settings')}
+                data-testid="nav-customize"
               >
                 <IconSliders />
                 {!collapsed && 'Customize'}
@@ -508,17 +548,19 @@ export default function Sidebar() {
                 </div>
               </div>
             )}
-            <div>
-              <p className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
-                Recent
-              </p>
-              <div className="space-y-0.5">
-                {recent.length === 0 && (
-                  <p className="px-2.5 py-2 text-xs text-[var(--muted)]">No chats yet</p>
-                )}
-                {recent.map((thread) => renderThreadRow(thread, collapsed))}
+            {dateGroups.length === 0 && pinned.length === 0 ? (
+              <p className="px-2.5 py-2 text-xs text-[var(--muted)]">No chats yet</p>
+            ) : null}
+            {dateGroups.map((group) => (
+              <div key={group.id} className="mb-3" data-testid={`chat-group-${group.id}`}>
+                <p className="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-[var(--muted)]">
+                  {group.label}
+                </p>
+                <div className="space-y-0.5">
+                  {group.items.map((thread) => renderThreadRow(thread, collapsed))}
+                </div>
               </div>
-            </div>
+            ))}
           </section>
         )}
       </div>
@@ -544,18 +586,24 @@ export default function Sidebar() {
             <div className="flex shrink-0 items-center gap-1">
               <button
                 type="button"
-                onClick={() => signOut()}
-                className="rounded-md border border-[var(--border)] px-2 py-1 text-[11px] uppercase tracking-wide text-[var(--muted)] hover:bg-[var(--hover)]"
+                onClick={() => {
+                  setViewMode('settings')
+                  setMobileSidebarOpen(false)
+                }}
+                className="rounded-md border border-[var(--border)] p-1 text-[var(--muted)] hover:bg-[var(--hover)] hover:text-[var(--app-fg)]"
+                aria-label="Settings"
+                title="Settings"
+                data-testid="sidebar-settings"
               >
-                Out
+                <IconSliders className="h-3.5 w-3.5" />
               </button>
               <button
                 type="button"
                 onClick={toggleAppearance}
                 className="rounded-md border border-[var(--border)] px-2 py-1 text-[11px] uppercase tracking-wide text-[var(--muted)] hover:bg-[var(--hover)]"
-                aria-label={`Switch to ${appearance === 'dark' ? 'light' : 'dark'} theme`}
+                aria-label={`Switch to ${resolvedAppearance === 'dark' ? 'light' : 'dark'} theme`}
               >
-                {appearance === 'dark' ? 'Dark' : 'Light'}
+                {resolvedAppearance === 'dark' ? 'Dark' : 'Light'}
               </button>
             </div>
           </div>
@@ -569,7 +617,7 @@ export default function Sidebar() {
               onClick={toggleAppearance}
               className="rounded border border-[var(--border)] px-1.5 py-1 text-[10px] text-[var(--muted)]"
             >
-              {appearance === 'dark' ? 'D' : 'L'}
+              {resolvedAppearance === 'dark' ? 'D' : 'L'}
             </button>
           </div>
         )}

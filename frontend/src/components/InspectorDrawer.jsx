@@ -1,5 +1,21 @@
 import { X } from 'lucide-react'
 
+const MAX_ATTEMPTS = 3
+
+const ROUTE_REASON_LABELS = {
+  force_confidential: 'Force confidential',
+  secrets_detected: 'Secrets detected',
+  classifier_unavailable: 'Classifier unavailable (fail-closed)',
+  sensitivity_threshold: 'Above sensitivity threshold',
+  cloud_allowed: 'Cloud allowed',
+}
+
+const RAG_SOURCE_LABELS = {
+  hybrid_supabase: 'Hybrid (pgvector + FTS, RRF)',
+  fallback_bm25: 'BM25 fallback (local files)',
+  none: 'None',
+}
+
 function Row({ label, value }) {
   return (
     <div className="flex items-start justify-between gap-3 py-2 border-b border-[var(--border)] text-sm">
@@ -9,7 +25,36 @@ function Row({ label, value }) {
   )
 }
 
-export default function InspectorDrawer({ open, onClose, meta }) {
+function SectionTitle({ children, first = false }) {
+  return (
+    <p
+      className={`text-xs uppercase tracking-wide text-[var(--muted)] mb-2 ${first ? '' : 'mt-4'}`}
+    >
+      {children}
+    </p>
+  )
+}
+
+function passLabel(value) {
+  if (value === true) return 'pass'
+  if (value === false) return 'fail'
+  return undefined
+}
+
+function streamState(meta, streaming) {
+  if (!meta) return undefined
+  if (streaming) {
+    if (!meta.routing) return 'routing'
+    if (!meta.rag) return 'retrieving'
+    if (!meta.quality) return 'generating'
+    return 'validating'
+  }
+  if (meta.stopped) return 'stopped'
+  if (meta.error) return 'error'
+  return 'completed'
+}
+
+export default function InspectorDrawer({ open, onClose, meta, streaming = false, docked = false }) {
   if (!open) return null
 
   const routing = meta?.routing
@@ -17,10 +62,28 @@ export default function InspectorDrawer({ open, onClose, meta }) {
   const quality = meta?.quality
   const skill = meta?.skill
   const retry = meta?.retry
+  const fallback = meta?.fallback
   const hasMetrics = Boolean(routing || rag || quality || skill || retry)
 
+  const layout = docked
+    ? 'absolute inset-y-0 right-0 z-20 w-full max-w-sm shadow-xl xl:static xl:z-auto xl:w-80 xl:max-w-none xl:shrink-0 xl:shadow-none'
+    : 'absolute inset-y-0 right-0 z-20 w-full max-w-sm shadow-xl'
+
+  const reranker =
+    rag?.reranker === 'flashrank'
+      ? 'FlashRank'
+      : rag?.source === 'hybrid_supabase' && rag?.hit_count > 0
+        ? 'FlashRank'
+        : rag
+          ? 'none'
+          : undefined
+
   return (
-    <div className="absolute inset-y-0 right-0 z-20 w-full max-w-sm border-l border-[var(--border)] bg-[var(--panel)] shadow-xl flex flex-col">
+    <aside
+      className={`${layout} border-l border-[var(--border)] bg-[var(--panel)] flex flex-col`}
+      data-testid="inspector-panel"
+      aria-label="Inspector"
+    >
       <div className="h-14 shrink-0 px-4 border-b border-[var(--border)] flex items-center justify-between">
         <h2 className="text-sm font-medium text-[var(--app-fg)]">Inspector</h2>
         <button
@@ -38,7 +101,7 @@ export default function InspectorDrawer({ open, onClose, meta }) {
           <p className="text-sm text-[var(--muted)]">No request metrics yet. Send a message to populate.</p>
         ) : (
           <>
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mb-2">Routing</p>
+            <SectionTitle first>Routing</SectionTitle>
             <Row label="Client" value={routing?.target_client} />
             <Row label="Provider" value={routing?.selected_provider} />
             <Row label="Model" value={routing?.selected_model} />
@@ -58,28 +121,54 @@ export default function InspectorDrawer({ open, onClose, meta }) {
                   : 'none'
               }
             />
+            <Row
+              label="Reason"
+              value={
+                routing?.route_reason
+                  ? ROUTE_REASON_LABELS[routing.route_reason] ?? routing.route_reason
+                  : undefined
+              }
+            />
+            <Row
+              label="Requires RAG"
+              value={typeof routing?.requires_rag === 'boolean' ? String(routing.requires_rag) : undefined}
+            />
+            {fallback ? (
+              <Row
+                label="Fallback"
+                value={`${fallback.from_provider} → ${fallback.to_provider} (${fallback.reason})`}
+              />
+            ) : null}
 
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mt-4 mb-2">Skill</p>
+            <SectionTitle>Skill</SectionTitle>
             <Row label="Mode" value={skill?.mode || 'none'} />
 
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mt-4 mb-2">RAG</p>
+            <SectionTitle>RAG</SectionTitle>
             <Row label="Status" value={rag?.status} />
+            <Row
+              label="Source"
+              value={rag?.source ? RAG_SOURCE_LABELS[rag.source] ?? rag.source : undefined}
+            />
+            <Row label="Reranker" value={reranker} />
             <Row label="Hits" value={rag?.hit_count} />
+            <Row label="Files" value={rag?.files?.length ? rag.files.join(', ') : undefined} />
             <Row label="Query" value={rag?.query || undefined} />
 
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mt-4 mb-2">Quality</p>
+            <SectionTitle>Quality</SectionTitle>
             <Row label="Valid" value={quality ? String(quality.is_valid) : undefined} />
-            <Row label="Tier 1" value={quality ? String(quality.tier1_schema_pass) : undefined} />
-            <Row label="Tier 2" value={quality ? String(quality.tier2_heuristic_pass) : undefined} />
+            <Row label="Tier 1" value={passLabel(quality?.tier1_schema_pass)} />
+            <Row label="Tier 2" value={passLabel(quality?.tier2_heuristic_pass)} />
             <Row label="Tier 3" value={quality?.tier3_score} />
             <Row label="Feedback" value={quality?.feedback || undefined} />
 
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mt-4 mb-2">Retry</p>
+            <SectionTitle>Retry</SectionTitle>
             <Row label="Attempt" value={retry?.attempt} />
+            <Row label="Max attempts" value={MAX_ATTEMPTS} />
             <Row label="Score" value={retry?.attempt_score} />
             <Row label="Reason" value={retry?.reason || undefined} />
 
-            <p className="text-xs uppercase tracking-wide text-[var(--muted)] mt-4 mb-2">Stream</p>
+            <SectionTitle>Stream</SectionTitle>
+            <Row label="State" value={streamState(meta, streaming)} />
             <Row label="Tokens" value={meta?.tokenCount} />
             <Row
               label="Latency"
@@ -88,6 +177,6 @@ export default function InspectorDrawer({ open, onClose, meta }) {
           </>
         )}
       </div>
-    </div>
+    </aside>
   )
 }

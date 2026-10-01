@@ -19,7 +19,6 @@ if str(_ROOT) not in sys.path:
 import httpx
 
 from backend.app.api.chat import (
-    _BILLING_NOTICE,
     _close_open_fence_suffix,
     _is_payment_required_error,
     _is_payment_required_token,
@@ -60,8 +59,6 @@ async def test_local_fallback_stream() -> None:
         if not pieces or pieces[0] != "\n```\n":
             _fail(f"expected fence closer first, got {pieces[:2]!r}")
 
-    if _BILLING_NOTICE not in text:
-        _fail("missing billing notice")
     if "[LOCAL MOCK EXECUTION]" not in text:
         _fail("missing local mock tokens")
 
@@ -95,8 +92,6 @@ async def test_openrouter_raises_402_path() -> None:
             out.append(piece)
 
     text = "".join(out)
-    if _BILLING_NOTICE not in text:
-        _fail("fallback after raise missing notice")
     if "[LOCAL MOCK EXECUTION]" not in text:
         _fail("fallback after raise missing local mock")
     if ("".join(prior_parts) + text).count("```") % 2 != 0:

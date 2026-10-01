@@ -18,3 +18,8 @@ frontend/build/
 
 # Workspaces et données locales
 workspace_projects/
+
+# Audit / usage logs (runtime)
+logs/
+# Generated code graph
+graphify-out/

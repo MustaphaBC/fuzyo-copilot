@@ -131,6 +131,8 @@ def _action_for(method: str, path: str) -> str:
         return "fs.create_and_ingest"
     if method == "POST" and path.rstrip("/") == _WORKSPACE_PREFIX:
         return "workspace.create"
+    if method == "DELETE" and path.rstrip("/").endswith("/knowledge"):
+        return "knowledge.delete"
     if method == "PUT" and "/workspaces/" in path:
         return "workspace.update"
     if method == "DELETE" and "/workspaces/" in path:
@@ -171,11 +173,14 @@ class AuditFsMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
 
         if audit and 200 <= response.status_code < 400:
+            file_path = _extract_file_path(path, body)
+            if file_path == "-" and request.query_params.get("name"):
+                file_path = request.query_params["name"].replace("\\", "/")
             append_audit_event(
                 user_id=_user_id_from_auth(request),
                 client_ip=_client_ip(request),
                 endpoint=path,
                 action=_action_for(method, path),
-                file_path=_extract_file_path(path, body),
+                file_path=file_path,
             )
         return response

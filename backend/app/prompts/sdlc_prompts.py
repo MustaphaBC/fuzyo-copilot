@@ -45,8 +45,14 @@ def build_elite_system_prompt(
     project_name: str | None = None,
     stack: Sequence[str] | str | None = None,
     domain: str | None = None,
+    project_instructions: str | None = None,
+    prefer_project_files: bool = False,
 ) -> str:
-    """Compose a 5-component elite system prompt for the given SDLC phase."""
+    """Compose a 5-component elite system prompt for the given SDLC phase.
+
+    ``project_instructions`` (workspace custom instructions) extend [CONTEXTE];
+    ``prefer_project_files`` adds a constraint to reuse existing project conventions.
+    """
     entry = get_phase(phase)
     if entry is None:
         constraints = "\n".join(
@@ -76,6 +82,13 @@ def build_elite_system_prompt(
         f"{len(_BASE_CONSTRAINTS) + 1}. Prioriser les livrables catalogue de cette phase "
         "lorsqu'ils sont pertinents pour la requête."
     )
+    if prefer_project_files:
+        extra += (
+            f"\n{len(_BASE_CONSTRAINTS) + 2}. Réutiliser en priorité les fichiers, modules et "
+            "conventions existants du projet plutôt que d'en inventer de nouveaux."
+        )
+    instructions = (project_instructions or "").strip()
+    instructions_block = f"\nInstructions projet :\n{instructions}\n" if instructions else ""
 
     return f"""{ELITE_PROMPT_MARKERS[0]}
 Tu es un {entry.default_role}, expert dans {entry.domain_expertise}.
@@ -87,7 +100,7 @@ Question clé : {entry.key_question}
 Stack & Environnement : {stack_label}.
 Livrables attendus de la phase :
 {deliverables}
-
+{instructions_block}
 {ELITE_PROMPT_MARKERS[2]}
 {entry.objective}
 Produit le livrable demandé par l'utilisateur en restant strictement dans le périmètre de la Phase {entry.id:02d}.

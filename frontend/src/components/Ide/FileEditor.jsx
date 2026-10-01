@@ -1,19 +1,16 @@
 import Editor from '@monaco-editor/react'
 import { useCallback, useMemo } from 'react'
-import { useApp } from '../../context/AppContext'
+import { useEditor } from '../../context/EditorContext'
+import { usePreferences } from '../../context/PreferencesContext'
 import { useUI } from '../../context/UIContext'
+import { useWorkspace } from '../../context/WorkspaceContext'
 import { apiFetch } from '../../lib/api'
 import { notifyWorkspaceFsUpdated } from '../../lib/saveLocalArtifact'
 
 export default function FileEditor() {
-  const {
-    activeWorkspace,
-    openFiles,
-    activeFilePath,
-    appearance,
-    updateIdeFileContent,
-    markDirty,
-  } = useApp()
+  const { activeWorkspace } = useWorkspace()
+  const { openFiles, activeFilePath, updateIdeFileContent, markDirty } = useEditor()
+  const { resolvedAppearance: appearance } = usePreferences()
   const { pushToast } = useUI()
 
   const active = useMemo(

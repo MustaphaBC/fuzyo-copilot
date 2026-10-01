@@ -1,10 +1,9 @@
 import { useState } from 'react'
-import { useApp } from '../../context/AppContext'
+import { useChatControls } from '../../context/ChatContext'
+import { useEditor } from '../../context/EditorContext'
 import { useUI } from '../../context/UIContext'
-import {
-  defaultArtifactFileName,
-  saveArtifactToLocalPc,
-} from '../../lib/saveLocalArtifact'
+import { useWorkspace } from '../../context/WorkspaceContext'
+import { defaultArtifactFileName } from '../../lib/saveLocalArtifact'
 
 export default function SaveLocalButton({
   content,
@@ -12,7 +11,9 @@ export default function SaveLocalButton({
   language,
   label = 'Save to Local PC',
 }) {
-  const { activeWorkspace, sdlcPhase } = useApp()
+  const { activeWorkspace } = useWorkspace()
+  const { sdlcPhase } = useChatControls()
+  const { saveLocalArtifact } = useEditor()
   const { pushToast } = useUI()
   const [busy, setBusy] = useState(false)
 
@@ -28,7 +29,7 @@ export default function SaveLocalButton({
     setBusy(true)
     try {
       const name = fileName || defaultArtifactFileName(language)
-      const result = await saveArtifactToLocalPc({
+      const result = await saveLocalArtifact({
         workspaceId: activeWorkspace.id,
         fileName: name,
         content: content || '',

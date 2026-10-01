@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import AsyncIterator
 from typing import Annotated, Any, Final
 from uuid import UUID
@@ -42,6 +43,12 @@ from backend.app.services.gatekeeper import evaluate_response
 from backend.app.services.llm_base import BaseLLMClient
 from backend.app.services.local_stub import MockLocalLLMClient
 from backend.app.services.privacy_router import route_prompt
+from backend.app.services.provider_fallback import (
+    failure_reason,
+    fallback_candidates,
+    is_provider_open,
+    record_provider_failure,
+)
 from backend.app.services.rag_service import search_workspace
 from backend.app.services.token_tracker import estimate_token_usage, log_token_usage
 from supabase import create_client
@@ -51,19 +58,12 @@ _log = get_logger("fuzyo.chat")
 
 _MAX_RETRY_ATTEMPTS: Final[int] = 3
 
-_RATE_LIMIT_RE = re.compile(r"HTTP\s*429|rate[\s_-]?limit", re.IGNORECASE)
 _PAYMENT_REQUIRED_RE = re.compile(
     r"HTTP\s*402|Payment Required|more credits|can only afford",
     re.IGNORECASE,
 )
 # Structured provider error tokens only — never match free-form assistant prose.
 _PROVIDER_ERROR_TOKEN_RE = re.compile(r"^\[(?P<provider>[^\]]+?) error: HTTP (?P<code>\d{3})\b")
-_FALLBACK_HTTP_CODES = frozenset({404, 429, 502, 503})
-
-_BILLING_NOTICE = (
-    "> **Billing notice:** Cloud provider returned HTTP 402 (payment/credits). "
-    "Switched to local mock execution.\n\n"
-)
 
 _PROVIDER_CLIENTS: dict[str, type[BaseLLMClient]] = {
     "groq": GroqClient,
@@ -112,27 +112,11 @@ def _resolve_client(decision: RouterDecision) -> BaseLLMClient:
     return client_cls(model=decision.selected_model)
 
 
-def _is_rate_limit_token(token: str) -> bool:
-    """True only for structured provider error tokens that mention rate limits."""
-    if not _PROVIDER_ERROR_TOKEN_RE.match(token or ""):
-        return False
-    return bool(_RATE_LIMIT_RE.search(token))
-
-
 def _is_payment_required_token(token: str) -> bool:
     """True only for structured `[provider error: HTTP 402 …]` tokens."""
     if not _PROVIDER_ERROR_TOKEN_RE.match(token or ""):
         return False
     return bool(_PAYMENT_REQUIRED_RE.search(token))
-
-
-def _is_fallback_error_token(token: str) -> bool:
-    """404 / 429 / 502 / 503 from a structured `[provider error: HTTP NNN …]` token."""
-    match = _PROVIDER_ERROR_TOKEN_RE.match(token or "")
-    if not match:
-        return False
-    code = int(match.group("code"))
-    return code in _FALLBACK_HTTP_CODES or _is_rate_limit_token(token)
 
 
 def _is_payment_required_error(exc: BaseException) -> bool:
@@ -156,11 +140,10 @@ async def _local_fallback_tokens(
     system_prompt: str | None,
     history: list[dict[str, str]] | None = None,
 ) -> AsyncIterator[str]:
-    """Yield fence closer (if needed), billing notice, then local mock tokens."""
+    """Yield fence closer (if needed), then local mock tokens."""
     closer = _close_open_fence_suffix(prior_text)
     if closer:
         yield closer
-    yield _BILLING_NOTICE
     local = MockLocalLLMClient()
     async for piece in local.generate_stream(
         user_prompt,
@@ -190,6 +173,36 @@ def _build_user_prompt(
         "Use the following workspace context when relevant.\n\n"
         f"{context}\n\n"
         f"User request:\n{prompt}"
+    )
+
+
+def _rag_source_files(rag_hits: list[dict[str, Any]], *, limit: int = 5) -> list[str]:
+    """Distinct source file names (basename only) for the Inspector."""
+    names: list[str] = []
+    for hit in rag_hits:
+        metadata = hit.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        raw = metadata.get("path") or metadata.get("source")
+        if not raw or raw == "bm25_local":
+            continue
+        name = str(raw).replace("\\", "/").rsplit("/", 1)[-1]
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+def _fallback_sse(*, from_provider: str, to_provider: str, target: str, reason: str) -> str:
+    return _sse(
+        {
+            "type": "fallback",
+            "from_provider": from_provider,
+            "to_provider": to_provider,
+            "target": target,
+            "reason": reason,
+        }
     )
 
 
@@ -234,6 +247,7 @@ async def _event_stream(
     request: ChatRequest,
     workspace: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
+    started = time.monotonic()
     decision = await route_prompt(request)
     yield _sse(
         {
@@ -244,6 +258,7 @@ async def _event_stream(
             "sensitivity_score": decision.sensitivity_score,
             "detected_secrets": decision.detected_secrets,
             "requires_rag": decision.requires_rag,
+            "route_reason": decision.route_reason.value,
         }
     )
 
@@ -255,7 +270,7 @@ async def _event_stream(
     rag_query = skill_rag_query(active_skill, cleaned_prompt)
 
     rag_hits: list[dict[str, Any]] = []
-    if decision.requires_rag and request.workspace_id:
+    if decision.requires_rag and request.workspace_id and request.use_workspace_knowledge:
         rag_source = "hybrid_supabase"
         try:
             rag_result = await search_workspace(request.workspace_id, rag_query)
@@ -273,6 +288,12 @@ async def _event_stream(
                 "source": rag_source,
                 "hit_count": len(rag_hits),
                 "query": rag_query,
+                "reranker": (
+                    "flashrank"
+                    if any("rerank_score" in hit for hit in rag_hits)
+                    else "none"
+                ),
+                "files": _rag_source_files(rag_hits),
                 "snippets": [
                     (hit.get("content") or "")[:160]
                     for hit in rag_hits[:3]
@@ -288,6 +309,8 @@ async def _event_stream(
                 "source": "none",
                 "hit_count": 0,
                 "query": rag_query,
+                "reranker": "none",
+                "files": [],
                 "snippets": [],
             }
         )
@@ -296,10 +319,15 @@ async def _event_stream(
     tech_stack = ws.get("tech_stack")
     if not isinstance(tech_stack, list):
         tech_stack = None
+    project_instructions = (
+        str(ws.get("custom_instructions") or "") if request.use_project_context else ""
+    )
     system_prompt = build_elite_system_prompt(
         int(request.sdlc_phase),
         project_name=str(ws.get("name") or "") or None,
         stack=tech_stack,
+        project_instructions=project_instructions or None,
+        prefer_project_files=bool(request.workspace_id) and request.prefer_project_files,
     )
     user_prompt = _build_user_prompt(request, rag_hits, prompt_text=cleaned_prompt)
 
@@ -319,101 +347,93 @@ async def _event_stream(
         touch_thread_updated_at(request.thread_id)
 
     client = _resolve_client(decision)
+    active_provider = decision.selected_provider
+    active_model: str | None = decision.selected_model
+    tried_providers: set[str] = {decision.selected_provider}
+    cloud_failover = decision.target_client == TargetClient.CLOUD_API
 
     full_text_parts: list[str] = []
     completion_texts: list[str] = []
-    used_openrouter = False
-    used_local_billing_fallback = False
 
-    async def _stream_from(
-        active: BaseLLMClient,
-        prompt: str,
-    ) -> AsyncIterator[str]:
+    async def _stream_from(active: BaseLLMClient, prompt: str) -> AsyncIterator[str]:
         async for piece in active.generate_stream(
             prompt,
             system_prompt=system_prompt or None,
-            model=decision.selected_model,
+            model=active_model,
             history=history,
         ):
             yield piece
 
-    async def _emit_local_billing_fallback(
-        prompt: str,
-        parts: list[str],
-    ) -> AsyncIterator[str]:
-        nonlocal used_local_billing_fallback
-        used_local_billing_fallback = True
-        prior = "".join(parts)
-        async for piece in _local_fallback_tokens(
-            prior,
-            prompt,
-            system_prompt or None,
-            history=history,
-        ):
-            parts.append(piece)
-            yield _sse({"type": "token", "content": piece})
+    async def _fail_over(prompt: str, parts: list[str], *, reason: str) -> AsyncIterator[str]:
+        """Switch to the next healthy cloud provider, or to the local model when none is left."""
+        nonlocal client, active_provider, active_model, cloud_failover
+        failed_provider = active_provider
+        closer = _close_open_fence_suffix("".join(parts))
+        candidates = fallback_candidates(exclude=tried_providers)
+        if not candidates:
+            cloud_failover = False
+            client = MockLocalLLMClient()
+            active_provider, active_model = "local_stub", None
+            yield _fallback_sse(
+                from_provider=failed_provider,
+                to_provider="local_stub",
+                target="LOCAL",
+                reason=reason,
+            )
+            async for piece in _local_fallback_tokens(
+                "".join(parts), prompt, system_prompt or None, history=history
+            ):
+                parts.append(piece)
+                yield _sse({"type": "token", "content": piece})
+            return
 
-    async def _run_model_stream(
-        prompt: str,
-        *,
-        parts: list[str],
-        active_client: BaseLLMClient | None = None,
-    ) -> AsyncIterator[str]:
-        nonlocal used_openrouter
-        stream_client = active_client if active_client is not None else client
-        try:
-            async for token in _stream_from(stream_client, prompt):
-                if (
-                    not used_openrouter
-                    and not used_local_billing_fallback
-                    and decision.target_client == TargetClient.CLOUD_API
-                    and _is_payment_required_token(token)
-                ):
-                    async for event in _emit_local_billing_fallback(prompt, parts):
-                        yield event
-                    break
+        nxt = candidates[0]
+        tried_providers.add(nxt.provider)
+        client = _PROVIDER_CLIENTS[nxt.provider](model=nxt.model)
+        active_provider, active_model = nxt.provider, nxt.model
+        if closer:
+            parts.append(closer)
+            yield _sse({"type": "token", "content": closer})
+        yield _fallback_sse(
+            from_provider=failed_provider,
+            to_provider=nxt.provider,
+            target="CLOUD",
+            reason=reason,
+        )
 
-                if (
-                    not used_openrouter
-                    and not used_local_billing_fallback
-                    and decision.target_client == TargetClient.CLOUD_API
-                    and decision.selected_provider != "openrouter"
-                    and _is_fallback_error_token(token)
-                ):
-                    used_openrouter = True
-                    fallback = OpenRouterClient(model="openrouter/auto")
-                    try:
-                        async for fb_token in _stream_from(fallback, prompt):
-                            if _is_payment_required_token(fb_token):
-                                async for event in _emit_local_billing_fallback(
-                                    prompt, parts
-                                ):
-                                    yield event
-                                break
-                            if _PROVIDER_ERROR_TOKEN_RE.match(fb_token or ""):
-                                parts.append(fb_token)
-                                yield _sse({"type": "token", "content": fb_token})
-                                break
-                            parts.append(fb_token)
-                            yield _sse({"type": "token", "content": fb_token})
-                    except httpx.HTTPStatusError as exc:
-                        if _is_payment_required_error(exc):
-                            async for event in _emit_local_billing_fallback(
-                                prompt, parts
-                            ):
-                                yield event
-                        else:
-                            raise
-                    break
+    async def _run_model_stream(prompt: str, *, parts: list[str]) -> AsyncIterator[str]:
+        if cloud_failover and is_provider_open(active_provider):
+            async for event in _fail_over(prompt, parts, reason="circuit_open"):
+                yield event
 
-                parts.append(token)
-                yield _sse({"type": "token", "content": token})
-        except httpx.HTTPStatusError as exc:
-            if _is_payment_required_error(exc) and not used_local_billing_fallback:
-                async for event in _emit_local_billing_fallback(prompt, parts):
-                    yield event
-            else:
-                raise
+        while True:
+            if not cloud_failover:
+                async for token in _stream_from(client, prompt):
+                    parts.append(token)
+                    yield _sse({"type": "token", "content": token})
+                return
+
+            failed = False
+            status_code: int | None = None
+            try:
+                async for token in _stream_from(client, prompt):
+                    match = _PROVIDER_ERROR_TOKEN_RE.match(token or "")
+                    if match:
+                        failed, status_code = True, int(match.group("code"))
+                        break
+                    parts.append(token)
+                    yield _sse({"type": "token", "content": token})
+            except httpx.HTTPStatusError as exc:
+                failed = True
+                status_code = exc.response.status_code if exc.response is not None else None
+            except httpx.TransportError:
+                failed = True
+
+            if not failed:
+                return
+            record_provider_failure(active_provider, status_code)
+            async for event in _fail_over(prompt, parts, reason=failure_reason(status_code)):
+                yield event
 
     async for event in _run_model_stream(user_prompt, parts=full_text_parts):
         yield event
@@ -452,17 +472,7 @@ async def _event_stream(
             combined_feedback=combined_feedback,
         )
         retry_parts: list[str] = []
-        retry_client: BaseLLMClient = (
-            MockLocalLLMClient()
-            if (used_local_billing_fallback or used_openrouter)
-            else client
-        )
-
-        async for event in _run_model_stream(
-            retry_prompt,
-            parts=retry_parts,
-            active_client=retry_client,
-        ):
+        async for event in _run_model_stream(retry_prompt, parts=retry_parts):
             yield event
 
         retry_text = "".join(retry_parts)
@@ -478,8 +488,8 @@ async def _event_stream(
     # Token / cost accounting — character lengths only; never log prompt bodies.
     prompt_for_count = f"{system_prompt}\n{user_prompt}"
     usage = estimate_token_usage(
-        provider=decision.selected_provider,
-        model=decision.selected_model,
+        provider=active_provider,
+        model=active_model or "mock-local",
         prompt_text=prompt_for_count,
         completion_text="".join(completion_texts),
     )
@@ -488,11 +498,16 @@ async def _event_stream(
         sdlc_phase=int(request.sdlc_phase),
         target_client=decision.target_client.value,
         force_confidential=bool(request.force_confidential),
+        latency_ms=int((time.monotonic() - started) * 1000),
+        attempts=attempt,
+        quality_score=score.tier3_score,
+        quality_passed=bool(score.is_valid and score.tier3_score >= 7),
+        route_reason=decision.route_reason.value,
     )
     _log.info(
         "chat_stream_complete",
-        provider=decision.selected_provider,
-        model=decision.selected_model,
+        provider=active_provider,
+        model=active_model or "mock-local",
         sdlc_phase=int(request.sdlc_phase),
         prompt_chars=len(prompt_for_count),
         completion_chars=sum(len(chunk) for chunk in completion_texts),

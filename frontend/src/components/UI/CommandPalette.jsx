@@ -15,13 +15,13 @@ export default function CommandPalette() {
     threads,
     workspaces,
     selectThread,
-    setActiveWorkspace,
     setViewMode,
     resetChat,
     toggleAppearance,
-    appearance,
+    resolvedAppearance: appearance,
     openWorkspaceModal,
     openWorkspaceInIde,
+    openProject,
     activeWorkspace,
     ideTreeCache,
     openIdeFile,
@@ -91,7 +91,13 @@ export default function CommandPalette() {
         id: 'projects',
         label: 'Go to Projects',
         group: 'Navigate',
-        run: () => setViewMode('dashboard'),
+        run: () => setViewMode('projects'),
+      },
+      {
+        id: 'settings',
+        label: 'Open Settings',
+        group: 'Navigate',
+        run: () => setViewMode('settings'),
       },
       {
         id: 'artifacts',
@@ -131,12 +137,9 @@ export default function CommandPalette() {
       })
       items.push({
         id: `ws-analytics-${ws.id}`,
-        label: `Analytics: ${ws.name}`,
+        label: `Overview: ${ws.name}`,
         group: 'Projects',
-        run: () => {
-          setActiveWorkspace(ws)
-          setViewMode('dashboard')
-        },
+        run: () => openProject(ws, 'overview'),
       })
     }
 
@@ -190,9 +193,9 @@ export default function CommandPalette() {
     openWorkspaceInIde,
     openWorkspaceModal,
     pushToast,
+    openProject,
     resetChat,
     selectThread,
-    setActiveWorkspace,
     setShortcutGuideOpen,
     setViewMode,
     threads,

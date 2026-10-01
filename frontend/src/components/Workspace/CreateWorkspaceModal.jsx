@@ -3,6 +3,7 @@ import { FolderUp, FileText, Upload, X } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 import { useApp } from '../../context/AppContext'
 import { apiFetch } from '../../lib/api'
+import { STACK_OPTIONS } from '../../lib/stackOptions'
 import { shouldIgnorePath } from '../../utils/ignoreFilter'
 
 const DOCS_EXTENSIONS = ['.md', '.markdown', '.pdf', '.docx', '.xlsx', '.csv']
@@ -22,20 +23,6 @@ const CODE_EXTENSIONS = [
   '.toml',
   '.sql',
   '.txt',
-]
-
-const STACK_OPTIONS = [
-  'React',
-  'FastAPI',
-  'Python',
-  'PostgreSQL',
-  'TypeScript',
-  'JavaScript',
-  'Docker',
-  'Supabase',
-  'Vite',
-  'Tailwind',
-  'Node.js',
 ]
 
 function hasExt(file, exts) {
@@ -75,6 +62,70 @@ async function zipCodeFiles(fileList, onProgress) {
   return { blob, added, skipped }
 }
 
+const INGEST_STEPS = [
+  { id: 'upload', label: 'Upload' },
+  { id: 'parse', label: 'Parse' },
+  { id: 'embed', label: 'Embed' },
+  { id: 'index', label: 'Index' },
+  { id: 'scan', label: 'Scan project' },
+  { id: 'ready', label: 'Ready' },
+]
+
+const POLL_INTERVAL_MS = 800
+const POLL_TIMEOUT_MS = 15 * 60 * 1000
+
+async function pollIngestJob(workspaceId, jobId, onUpdate) {
+  const deadline = Date.now() + POLL_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const response = await apiFetch(`/api/v1/workspaces/${workspaceId}/ingest-jobs/${jobId}`)
+    if (!response.ok) throw new Error((await response.text()) || `Ingest status HTTP ${response.status}`)
+    const job = await response.json()
+    onUpdate(job)
+    if (job.status !== 'running') return job
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+  }
+  throw new Error('Ingest is still running — check the Knowledge tab later.')
+}
+
+function IngestProgress({ job }) {
+  const activeIndex = Math.max(
+    0,
+    INGEST_STEPS.findIndex((step) => step.id === (job.step === 'filter' ? 'parse' : job.step)),
+  )
+  return (
+    <div className="space-y-2 rounded-md border border-[var(--border)] bg-[var(--panel-elevated)] p-3" data-testid="ingest-progress">
+      <ol className="flex flex-wrap gap-1.5 text-[11px]">
+        {INGEST_STEPS.map((step, index) => {
+          const done = index < activeIndex || job.status === 'completed'
+          const active = index === activeIndex && job.status === 'running'
+          return (
+            <li
+              key={step.id}
+              data-state={done ? 'done' : active ? 'active' : 'pending'}
+              className={`rounded-full border px-2 py-0.5 ${
+                done
+                  ? 'border-emerald-600/50 text-emerald-700 dark:text-emerald-300'
+                  : active
+                    ? 'border-sky-500/60 text-sky-700 dark:text-sky-300'
+                    : 'border-[var(--border)] text-[var(--muted)]'
+              }`}
+            >
+              {step.label}
+            </li>
+          )
+        })}
+      </ol>
+      {job.total_files ? (
+        <p className="text-xs text-[var(--muted)]">
+          {job.processed_files}/{job.total_files} files · {job.chunks_inserted ?? 0} chunks
+          {job.skipped_ignored ? ` · ${job.skipped_ignored} skipped` : ''}
+          {job.current_file ? ` · ${job.current_file}` : ''}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
 export default function CreateWorkspaceModal({ onClose }) {
   const { sdlcPhase, refreshWorkspaces, setActiveWorkspace } = useApp()
   const [name, setName] = useState('')
@@ -89,6 +140,7 @@ export default function CreateWorkspaceModal({ onClose }) {
   const [progress, setProgress] = useState(null)
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
+  const [ingestJob, setIngestJob] = useState(null)
   const docsInputRef = useRef(null)
   const dirInputRef = useRef(null)
   const zipInputRef = useRef(null)
@@ -142,6 +194,10 @@ export default function CreateWorkspaceModal({ onClose }) {
         body.append('zip_file', blob, `${trimmed.replace(/\s+/g, '-').toLowerCase() || 'codebase'}.zip`)
       }
 
+      const hasUploads = body.has('files') || body.has('zip_file')
+      if (hasUploads) body.append('async_ingest', 'true')
+      setIngestJob({ step: 'upload', status: 'running', processed_files: 0, total_files: 0 })
+
       const response = await apiFetch('/api/v1/workspaces/create-and-ingest', {
         method: 'POST',
         body,
@@ -151,14 +207,22 @@ export default function CreateWorkspaceModal({ onClose }) {
       }
       const payload = await response.json()
       const workspace = payload.workspace || payload
+      const finalJob = payload.job_id
+        ? await pollIngestJob(workspace.id, payload.job_id, setIngestJob)
+        : null
       await refreshWorkspaces(workspace.id)
       setActiveWorkspace(workspace)
+      if (finalJob?.status === 'failed') {
+        setError(`Workspace created, but ingest failed: ${finalJob.error || 'unknown error'}`)
+        return
+      }
       onClose?.()
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Request failed')
     } finally {
       setSubmitting(false)
       setProgress(null)
+      setIngestJob(null)
     }
   }
 
@@ -384,6 +448,7 @@ export default function CreateWorkspaceModal({ onClose }) {
           )}
 
           {statusLine ? <p className="text-xs text-[var(--muted)]">{statusLine}</p> : null}
+          {ingestJob ? <IngestProgress job={ingestJob} /> : null}
           {error ? (
             <p className="rounded-md border border-red-900/60 bg-red-950/30 px-3 py-2 text-xs text-red-300">
               {error}

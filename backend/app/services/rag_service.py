@@ -203,8 +203,13 @@ async def ingest_file(
     path: Path | str,
     *,
     sdlc_phase: int = 1,
+    display_name: str | None = None,
 ) -> int:
-    """Parse, embed, and insert document chunks. Returns number of rows inserted."""
+    """Parse, embed, and insert document chunks. Returns number of rows inserted.
+
+    ``display_name`` is stored as ``metadata.name`` so the Knowledge listing can
+    group chunks by the user-facing file name instead of a temp path.
+    """
     file_path = Path(path)
     try:
         loader = get_loader(file_path)
@@ -215,6 +220,9 @@ async def ingest_file(
     chunks = loader.load(file_path, sdlc_phase=sdlc_phase)
     if not chunks:
         return 0
+    name = (display_name or file_path.name).replace("\\", "/")
+    for chunk in chunks:
+        chunk.metadata["name"] = name
 
     vectors = await embed_texts([c.content for c in chunks], input_type="search_document")
     if not vectors or len(vectors) != len(chunks):
@@ -234,6 +242,15 @@ async def ingest_file(
         }
         for chunk, vector in zip(chunks, vectors, strict=True)
     ]
+
+    if display_name:
+        # Re-ingesting the same document replaces its previous chunks.
+        try:
+            client.table("document_chunks").delete().eq(
+                "workspace_id", str(workspace_id)
+            ).eq("metadata->>name", name).execute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Previous chunk purge failed for %s: %s", name, exc)
 
     try:
         result = client.table("document_chunks").insert(rows).execute()

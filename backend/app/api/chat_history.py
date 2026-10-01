@@ -132,7 +132,7 @@ async def replace_thread_messages(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> list[ChatMessageOut]:
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     _ensure_thread(client, workspace_id, thread_id)
 
     try:
@@ -187,7 +187,7 @@ async def delete_thread_messages(
     user: Annotated[CurrentUser, Depends(get_current_user)],
 ) -> dict[str, str | int]:
     client = _supabase()
-    ensure_owned_workspace(client, workspace_id, user.id)
+    ensure_owned_workspace(client, workspace_id, user.id, fresh=True)
     try:
         result = (
             client.table("chat_messages")

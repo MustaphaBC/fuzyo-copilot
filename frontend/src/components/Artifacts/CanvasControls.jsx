@@ -1,4 +1,4 @@
-import { Download, Maximize2, Minus, Plus, RotateCcw, X } from 'lucide-react'
+import { Download, Minus, Plus, RotateCcw, X } from 'lucide-react'
 
 /**
  * Floating viewport toolbar for the Artifact Canvas.
@@ -11,7 +11,6 @@ export default function CanvasControls({
   onReset,
   onExport,
   onClose,
-  onPopout,
   title,
 }) {
   const pct = Math.round(Number(scale) * 100)
@@ -76,19 +75,6 @@ export default function CanvasControls({
           className="rounded-lg p-2 text-white/80 transition hover:bg-white/10 hover:text-white"
         >
           <Download className="h-4 w-4" />
-        </button>
-      ) : null}
-
-      {typeof onPopout === 'function' ? (
-        <button
-          type="button"
-          data-testid="canvas-popout"
-          aria-label="Pop out"
-          title="Pop out"
-          onClick={onPopout}
-          className="rounded-lg p-2 text-white/80 transition hover:bg-white/10 hover:text-white"
-        >
-          <Maximize2 className="h-4 w-4" />
         </button>
       ) : null}
 

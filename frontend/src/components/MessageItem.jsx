@@ -1,6 +1,8 @@
 import { Copy, Pencil, RefreshCw } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import DynamicMessageRenderer, { splitMessageParts } from './Chat/DynamicMessageRenderer'
+import StatusCards from './Chat/StatusCards'
+import StreamStepper from './Chat/StreamStepper'
 
 function collectPreviousCode(messages, beforeId) {
   const map = {}
@@ -25,6 +27,8 @@ export default function MessageItem({
   isStreaming,
   isRetrying = false,
   retryScore,
+  retryAttempt,
+  notices = [],
   onEditUser,
   onRegenerate,
   messages = [],
@@ -77,13 +81,25 @@ export default function MessageItem({
           {isRetrying && !isUser ? (
             <span
               data-testid="retry-badge"
-              className="inline-flex items-center gap-1 rounded border border-amber-700/50 bg-amber-950/30 px-1.5 py-0.5 text-[10px] normal-case tracking-normal text-amber-300"
+              className="inline-flex items-center gap-1 rounded border border-amber-600/50 bg-amber-50 px-1.5 py-0.5 text-[10px] normal-case tracking-normal text-amber-800 dark:border-amber-700/50 dark:bg-amber-950/30 dark:text-amber-300"
             >
               <RefreshCw className="h-3 w-3 animate-spin" aria-hidden="true" />
-              Retrying ({retryScore}/10)…
+              {retryAttempt ? `Attempt ${retryAttempt}/3 · ` : ''}Retrying ({retryScore}/10)…
             </span>
           ) : null}
         </div>
+
+        {!isUser && isLatestAssistant && isStreaming ? (
+          <StreamStepper meta={meta} streaming className="mb-2" />
+        ) : null}
+
+        {!isUser ? (
+          <StatusCards
+            notices={notices}
+            onRetry={onRegenerate ? () => onRegenerate(id) : undefined}
+          />
+        ) : null}
+        {!isUser && notices?.length ? <div className="h-2" aria-hidden="true" /> : null}
 
         {editing ? (
           <div className="space-y-2">

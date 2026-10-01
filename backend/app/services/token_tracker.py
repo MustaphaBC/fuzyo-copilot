@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+from collections import deque
 from dataclasses import dataclass
-from typing import Mapping
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Mapping
 
 from backend.app.core.logging_config import get_logger
 
@@ -79,23 +84,78 @@ def estimate_token_usage(
     )
 
 
+def usage_log_path() -> Path:
+    """Append-only usage records (override with USAGE_LOG_PATH)."""
+    raw = (os.environ.get("USAGE_LOG_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path(__file__).resolve().parents[3] / "logs" / "usage.log").resolve()
+
+
+def _append_usage_record(record: dict[str, Any]) -> None:
+    try:
+        path = usage_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        _log.warning("usage_log_write_failed", error=str(exc))
+
+
+def read_usage_records(limit: int = 5000) -> list[dict[str, Any]]:
+    """Most recent usage records (oldest first), skipping malformed lines."""
+    path = usage_log_path()
+    if not path.is_file():
+        return []
+    tail: deque[str] = deque(maxlen=max(1, limit))
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.strip():
+                    tail.append(line)
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in tail:
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            records.append(data)
+    return records
+
+
 def log_token_usage(
     usage: TokenUsage,
     *,
     sdlc_phase: int | None = None,
     target_client: str | None = None,
     force_confidential: bool = False,
+    latency_ms: int | None = None,
+    attempts: int | None = None,
+    quality_score: int | None = None,
+    quality_passed: bool | None = None,
+    route_reason: str | None = None,
 ) -> None:
-    """Emit a structured usage event — never includes prompt/completion bodies."""
-    _log.info(
-        "llm_token_usage",
-        provider=usage.provider,
-        model=usage.model,
-        prompt_tokens=usage.prompt_tokens,
-        completion_tokens=usage.completion_tokens,
-        total_tokens=usage.total_tokens,
-        estimated_cost_usd=usage.estimated_cost_usd,
-        sdlc_phase=sdlc_phase,
-        target_client=target_client,
-        force_confidential=bool(force_confidential),
+    """Emit + persist a usage event — never includes prompt/completion bodies."""
+    fields: dict[str, Any] = {
+        "provider": usage.provider,
+        "model": usage.model,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+        "estimated_cost_usd": usage.estimated_cost_usd,
+        "sdlc_phase": sdlc_phase,
+        "target_client": target_client,
+        "force_confidential": bool(force_confidential),
+        "latency_ms": latency_ms,
+        "attempts": attempts,
+        "quality_score": quality_score,
+        "quality_passed": quality_passed,
+        "route_reason": route_reason,
+    }
+    _log.info("llm_token_usage", **fields)
+    _append_usage_record(
+        {"timestamp": datetime.now(timezone.utc).isoformat(), **fields}
     )

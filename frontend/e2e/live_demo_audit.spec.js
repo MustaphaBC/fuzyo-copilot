@@ -506,6 +506,9 @@ async function setConfidential(page, on) {
   const checked = (await confidential.getAttribute('aria-checked')) === 'true'
   if (checked !== on) {
     await confidential.click()
+    if (on) {
+      await page.getByTestId('force-confidential-enable').click()
+    }
   }
   await expect(confidential).toHaveAttribute('aria-checked', on ? 'true' : 'false')
 }

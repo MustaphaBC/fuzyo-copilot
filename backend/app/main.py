@@ -6,9 +6,12 @@ from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from backend.app.api.admin import router as admin_router
 from backend.app.api.chat import router as chat_router
 from backend.app.api.chat_history import router as chat_history_router
 from backend.app.api.deliverables import router as deliverables_router
+from backend.app.api.knowledge import router as knowledge_router
+from backend.app.api.me import router as me_router
 from backend.app.api.models import router as models_router
 from backend.app.api.threads import router as threads_router
 from backend.app.api.uat_signoff import router as uat_router
@@ -73,6 +76,9 @@ app.include_router(uat_router, prefix="/api/v1")
 app.include_router(chat_history_router, prefix="/api/v1")
 app.include_router(threads_router, prefix="/api/v1")
 app.include_router(models_router, prefix="/api/v1")
+app.include_router(knowledge_router, prefix="/api/v1")
+app.include_router(me_router, prefix="/api/v1")
+app.include_router(admin_router, prefix="/api/v1")
 
 
 @app.get("/health")

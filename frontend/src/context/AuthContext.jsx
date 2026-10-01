@@ -28,6 +28,7 @@ export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)
   const [loading, setLoading] = useState(true)
   const [apiAuthError, setApiAuthError] = useState(null)
+  const [sessionExpired, setSessionExpired] = useState(false)
 
   useEffect(() => {
     if (E2E_BYPASS) {
@@ -55,6 +56,7 @@ export function AuthProvider({ children }) {
       setLoading(false)
       if (nextSession) {
         setApiAuthError(null)
+        setSessionExpired(false)
       }
     })
 
@@ -87,6 +89,7 @@ export function AuthProvider({ children }) {
       // Misconfigured SUPABASE_JWT_SECRET / Invalid token must NOT bounce to AuthScreen.
       if (expired) {
         await signOut()
+        setSessionExpired(true)
         return
       }
 
@@ -117,6 +120,7 @@ export function AuthProvider({ children }) {
     if (!error && data?.session) {
       applySession(data.session, setSession)
       setApiAuthError(null)
+      setSessionExpired(false)
       setLoading(false)
     }
     return { data, error }
@@ -160,9 +164,10 @@ export function AuthProvider({ children }) {
       signOut,
       apiAuthError,
       clearApiAuthError,
+      sessionExpired,
       configured: E2E_BYPASS || Boolean(supabase),
     }),
-    [session, loading, signIn, signUp, signOut, apiAuthError, clearApiAuthError],
+    [session, loading, signIn, signUp, signOut, apiAuthError, clearApiAuthError, sessionExpired],
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>

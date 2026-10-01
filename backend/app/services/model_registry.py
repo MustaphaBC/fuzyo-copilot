@@ -22,8 +22,8 @@ PROVIDER_CATALOG: tuple[dict[str, str], ...] = (
     },
     {
         "provider": "cerebras",
-        "id": "llama3.1-8b",
-        "label": "Cerebras Llama 3.1 8B",
+        "id": "qwen-3.8-27b",
+        "label": "Cerebras Qwen 3.8 27B",
         "key_attr": "cerebras_api_key",
     },
     {
